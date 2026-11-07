@@ -7,7 +7,9 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 
 use bern::wake::Waker;
 use encoding_rs::{
@@ -49,6 +51,8 @@ pub struct Session {
     pub title: String,
     pub total_bytes: u64,
     shared: Arc<Shared>,
+    cancel: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
 }
 
 /// What the engine copies into protocol state; one page at a time.
@@ -67,11 +71,20 @@ pub struct Snapshot {
 }
 
 impl Session {
-    pub fn stop(&self) {
-        let (lock, ready) = &*self.shared;
-        let mut data = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        data.closed = true;
-        ready.notify_all();
+    /// Stops the worker and waits for it to release the engine mutex before
+    /// the caller deletes the staging copy. Without the join the worker could
+    /// still be inside 7-Zip, and Windows then refuses to remove the folder.
+    pub fn stop(&mut self) {
+        {
+            let (lock, ready) = &*self.shared;
+            let mut data = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            data.closed = true;
+            ready.notify_all();
+        }
+        self.cancel.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -137,7 +150,7 @@ impl Drop for Session {
 
 pub fn start(
     archive: PathBuf,
-    password: Option<String>,
+    mut password: Option<String>,
     entry: String,
     title: String,
     total_bytes: u64,
@@ -158,19 +171,31 @@ pub fn start(
         Condvar::new(),
     ));
     let worker_shared = shared.clone();
-    std::thread::spawn(move || {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = cancel.clone();
+    let handle = std::thread::spawn(move || {
         let mut decoder = StreamDecoder::new(worker_shared, Some(wake));
-        match backend::stream_entry(&archive, password.as_deref(), &entry, |chunk| {
-            decoder.feed(chunk)
-        }) {
+        match backend::stream_entry(
+            &archive,
+            password.as_deref(),
+            &entry,
+            Some(&worker_cancel),
+            |chunk| decoder.feed(chunk),
+        ) {
             Ok(()) => decoder.finish(),
             Err(error) => decoder.fail(error),
+        }
+        if let Some(password) = password.as_mut() {
+            use zeroize::Zeroize;
+            password.zeroize();
         }
     });
     Session {
         title,
         total_bytes,
         shared,
+        cancel,
+        handle: Some(handle),
     }
 }
 
@@ -490,6 +515,8 @@ mod tests {
                 }),
                 Condvar::new(),
             )),
+            cancel: Arc::new(AtomicBool::new(false)),
+            handle: None,
         }
     }
 

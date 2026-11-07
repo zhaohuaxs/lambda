@@ -6,7 +6,6 @@
 //! 都不落密码。标签不是秘密，放 JSON 才能在没有凭据库的测试环境里也把
 //! 「有哪些保存项」说清楚；值读不出来时按「没有」处理，绝不回退到明文。
 
-use std::fs;
 use std::path::PathBuf;
 
 use bern::CommandError;
@@ -44,8 +43,7 @@ fn id_of(label: &str) -> String {
 }
 
 pub fn load() -> Vec<Record> {
-    let text = fs::read_to_string(store_path()).unwrap_or_default();
-    let value: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+    let value = crate::store::read_json(&store_path()).unwrap_or(serde_json::Value::Null);
     value
         .as_array()
         .map(|items| items.iter().filter_map(Record::from_value).collect())
@@ -85,12 +83,7 @@ impl Record {
 
 fn store(records: &[Record]) -> Result<(), CommandError> {
     let array = serde_json::Value::Array(records.iter().map(Record::to_value).collect());
-    let text = serde_json::to_string_pretty(&array)
-        .map_err(|error| CommandError::new("password", error.to_string()))?;
-    if let Some(parent) = store_path().parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    fs::write(store_path(), text)
+    crate::store::write_json(&store_path(), &array)
         .map_err(|error| CommandError::new("password", format!("写入密码簿失败：{error}")))
 }
 
@@ -159,11 +152,7 @@ mod tests {
     fn the_same_label_maps_to_the_same_id() {
         assert_eq!(id_of("下载站"), id_of("下载站"));
         assert_ne!(id_of("下载站"), id_of("备份"));
-        assert!(
-            id_of("下载站")
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric())
-        );
+        assert!(id_of("下载站").chars().all(|c| c.is_ascii_alphanumeric()));
     }
 
     #[test]

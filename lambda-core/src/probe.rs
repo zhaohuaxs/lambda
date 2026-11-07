@@ -47,7 +47,9 @@ fn write(path: &Path, bytes: &[u8]) -> Result<(), String> {
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 fn names_under(dir: &Path) -> Vec<String> {
     fn walk(root: &Path, path: &Path, out: &mut Vec<String>) {
-        let Ok(entries) = fs::read_dir(path) else { return };
+        let Ok(entries) = fs::read_dir(path) else {
+            return;
+        };
         for entry in entries.flatten() {
             let child = entry.path();
             if child.is_dir() {
@@ -65,7 +67,10 @@ fn names_under(dir: &Path) -> Vec<String> {
 
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 fn stem(name: &str) -> String {
-    name.rsplit_once('.').map(|(head, _)| head).unwrap_or(name).to_string()
+    name.rsplit_once('.')
+        .map(|(head, _)| head)
+        .unwrap_or(name)
+        .to_string()
 }
 
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
@@ -210,7 +215,7 @@ mod android {
 
     use sevenzip_src as engine;
 
-    use super::{clip, names_under, stem, write, yes_no, zip_bytes, vm_hwm_kb};
+    use super::{clip, names_under, stem, vm_hwm_kb, write, yes_no, zip_bytes};
 
     /// 应用私有目录：报告与位置表都住这里，不需要任何权限。
     fn data_root() -> PathBuf {
@@ -296,15 +301,18 @@ mod android {
         fn check(&mut self, id: &str, name: &str, ok: bool, detail: impl Into<String>) {
             if ok {
                 self.pass += 1;
-                self.lines.push(format!("✓ {id} {name} — {}", detail.into()));
+                self.lines
+                    .push(format!("✓ {id} {name} — {}", detail.into()));
             } else {
                 self.fail += 1;
-                self.lines.push(format!("✗ {id} {name} — {}", detail.into()));
+                self.lines
+                    .push(format!("✗ {id} {name} — {}", detail.into()));
             }
         }
     }
 
     pub fn run(dest: Option<&str>) -> String {
+        crate::backend::prepare_engine();
         let started = Instant::now();
         let root = bench_root();
         let _ = fs::remove_dir_all(&root);
@@ -469,11 +477,7 @@ mod android {
         let started = Instant::now();
         match engine::list(&f.deep_7z, None) {
             Ok(entries) => {
-                let deepest = entries
-                    .iter()
-                    .map(|e| e.path.len())
-                    .max()
-                    .unwrap_or(0);
+                let deepest = entries.iter().map(|e| e.path.len()).max().unwrap_or(0);
                 tally.check(
                     "T02",
                     "list 20 层深路径",
@@ -511,14 +515,22 @@ mod android {
                         "未报错，列出 {} 条目（{} ms）{}",
                         entries.len(),
                         started.elapsed().as_millis(),
-                        if id == "T07" { "—— 截断仍可部分可读，记入边界" } else { "" }
+                        if id == "T07" {
+                            "—— 截断仍可部分可读，记入边界"
+                        } else {
+                            ""
+                        }
                     ),
                 ),
                 Err(error) => tally.check(
                     id,
                     label,
                     true,
-                    format!("拒绝：{}（{} ms）", clip(&error.0, 120), started.elapsed().as_millis()),
+                    format!(
+                        "拒绝：{}（{} ms）",
+                        clip(&error.0, 120),
+                        started.elapsed().as_millis()
+                    ),
                 ),
             }
         }
@@ -597,7 +609,11 @@ mod android {
             "T11",
             "解压覆盖同名旧文件",
             ok,
-            if ok { "旧内容被替换为归档内内容" } else { "旧文件未被覆盖或解压失败" },
+            if ok {
+                "旧内容被替换为归档内内容"
+            } else {
+                "旧文件未被覆盖或解压失败"
+            },
         );
 
         let deep_target = f.out.join("deep");
@@ -678,7 +694,12 @@ mod android {
                 false,
                 format!("意外成功，释放 {} 文件", report.files),
             ),
-            Err(error) => tally.check("T16", "目录当归档", true, format!("拒绝：{}", clip(&error.0, 100))),
+            Err(error) => tally.check(
+                "T16",
+                "目录当归档",
+                true,
+                format!("拒绝：{}", clip(&error.0, 100)),
+            ),
         }
     }
 
@@ -710,7 +731,11 @@ mod android {
                 format!(
                     "{} 文件：{} · 目标外泄漏 {} 处{}",
                     report.files,
-                    if inside.is_empty() { "（空）".into() } else { inside.join(", ") },
+                    if inside.is_empty() {
+                        "（空）".into()
+                    } else {
+                        inside.join(", ")
+                    },
                     escaped.len(),
                     if escaped.is_empty() {
                         String::new()
@@ -723,7 +748,11 @@ mod android {
                 "T17",
                 "穿越条目被拒绝",
                 escaped.is_empty(),
-                format!("引擎拒绝：{} · 目标外泄漏 {} 处", clip(&error.0, 100), escaped.len()),
+                format!(
+                    "引擎拒绝：{} · 目标外泄漏 {} 处",
+                    clip(&error.0, 100),
+                    escaped.len()
+                ),
             ),
         }
     }
@@ -739,7 +768,10 @@ mod android {
         let _ = fs::create_dir_all(&many);
         let started = Instant::now();
         for index in 0..5000 {
-            let _ = fs::write(many.join(format!("f{index:05}.txt")), b"lambda many files probe\n");
+            let _ = fs::write(
+                many.join(format!("f{index:05}.txt")),
+                b"lambda many files probe\n",
+            );
         }
         let wrote = started.elapsed().as_millis();
 
@@ -769,7 +801,10 @@ mod android {
                     "B02",
                     "列举 5000 条目",
                     entries.len() >= 5000,
-                    format!("{} 条目 · {list_ms} ms · 峰值 RSS {after_list} KB", entries.len()),
+                    format!(
+                        "{} 条目 · {list_ms} ms · 峰值 RSS {after_list} KB",
+                        entries.len()
+                    ),
                 );
             }
             Err(error) => tally.check("B02", "列举 5000 条目", false, error.0),

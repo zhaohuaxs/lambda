@@ -22,9 +22,9 @@ use crate::browser;
 /// The host holds the whole encoded picture, then a decoded copy at screen
 /// size; 64 MB keeps both within a phone's budget.
 pub const MAX_BYTES: u64 = 64 * 1024 * 1024;
-/// A decompression bomb still has to be turned into sampling options; a
-/// 50 MP cap rejects the absurd before a decoder is asked.
-pub const MAX_PIXELS: u64 = 50_000_000;
+/// A decompression bomb still has to be turned into sampling options; 24 MP
+/// keeps a decoded 4-byte-per-pixel copy near 96 MB, which a phone can take.
+pub const MAX_PIXELS: u64 = 24_000_000;
 
 const SCHEME: &str = "lambda-picture";
 
@@ -53,7 +53,17 @@ struct Served {
     size: u64,
     status: Arc<Mutex<Status>>,
     closed: Arc<AtomicBool>,
+    busy: Arc<Mutex<()>>,
     wake: Option<Waker>,
+}
+
+impl Drop for Served {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        if let Some(password) = self.password.as_mut() {
+            password.zeroize();
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -69,11 +79,27 @@ pub struct Session {
     title: String,
     status: Arc<Mutex<Status>>,
     closed: Arc<AtomicBool>,
+    busy: Arc<Mutex<()>>,
 }
 
 static SERVED: OnceLock<Mutex<HashMap<u64, Served>>> = OnceLock::new();
 static NEXT: AtomicU64 = AtomicU64::new(1);
+static TOKEN_SEED: OnceLock<u64> = OnceLock::new();
 static REGISTER: Once = Once::new();
+
+/// Not cryptographic, but not enumerable from 1 either: a per-process seed
+/// mixed with a counter. The scheme is only reachable from the host's
+/// in-process `Image` control.
+fn next_token() -> u64 {
+    let seed = *TOKEN_SEED.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos() as u64)
+            .unwrap_or(0);
+        nanos ^ (u64::from(std::process::id()) << 32)
+    });
+    seed.wrapping_add(NEXT.fetch_add(1, Ordering::Relaxed)) | 1
+}
 
 fn served() -> &'static Mutex<HashMap<u64, Served>> {
     SERVED.get_or_init(|| Mutex::new(HashMap::new()))
@@ -95,12 +121,11 @@ fn register() {
                 .strip_prefix(SCHEME)
                 .and_then(|rest| rest.strip_prefix(':'))
                 .and_then(|rest| rest.parse::<u64>().ok())
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "无效的图片预览地址")
-                })?;
-            let served = lock(served()).get(&token).cloned().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, "图片预览已关闭")
-            })?;
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "无效的图片预览地址"))?;
+            let served = lock(served())
+                .get(&token)
+                .cloned()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "图片预览已关闭"))?;
             read(&served)
         });
     });
@@ -115,9 +140,10 @@ pub fn start(
     wake: Waker,
 ) -> Session {
     register();
-    let token = NEXT.fetch_add(1, Ordering::Relaxed);
+    let token = next_token();
     let status = Arc::new(Mutex::new(Status::default()));
     let closed = Arc::new(AtomicBool::new(false));
+    let busy = Arc::new(Mutex::new(()));
     lock(served()).insert(
         token,
         Served {
@@ -127,6 +153,7 @@ pub fn start(
             size,
             status: status.clone(),
             closed: closed.clone(),
+            busy: busy.clone(),
             wake: Some(wake),
         },
     );
@@ -136,6 +163,7 @@ pub fn start(
         title,
         status,
         closed,
+        busy,
     }
 }
 
@@ -159,10 +187,12 @@ impl Session {
 
     /// Stop an in-flight read and drop the token; the host keeps only the
     /// decoded picture it already has, under a URL no later preview reuses.
+    /// Waits for the engine call to return so the caller can delete staging.
     pub fn stop(&self) {
         if !self.closed.swap(true, Ordering::AcqRel) {
             lock(served()).remove(&self.token);
         }
+        let _busy = lock(&self.busy);
     }
 }
 
@@ -210,6 +240,8 @@ fn ready(served: &Served, info: &PictureInfo, bytes: u64) {
 }
 
 fn read(served: &Served) -> io::Result<Box<dyn Read + Send>> {
+    // One engine read per token at a time; `stop` waits on the same lock.
+    let _busy = lock(&served.busy);
     if served.size > MAX_BYTES {
         fail(
             served,
@@ -217,13 +249,14 @@ fn read(served: &Served) -> io::Result<Box<dyn Read + Send>> {
         );
         return Err(io::Error::new(io::ErrorKind::InvalidData, "图片过大"));
     }
-    let mut bytes = Vec::with_capacity(served.size.min(MAX_BYTES) as usize);
+    let mut bytes = Vec::with_capacity(served.size.min(1024 * 1024) as usize);
     let mut stopped = false;
     let mut too_big = false;
     let outcome = backend::stream_entry(
         &served.archive,
         served.password.as_deref(),
         &served.entry,
+        Some(served.closed.as_ref()),
         |chunk| {
             if served.closed.load(Ordering::Relaxed) {
                 stopped = true;
@@ -330,7 +363,18 @@ fn jpeg(bytes: &[u8]) -> Option<PictureInfo> {
         }
         if matches!(
             marker,
-            0xC0 | 0xC1 | 0xC2 | 0xC3 | 0xC5 | 0xC6 | 0xC7 | 0xC9 | 0xCA | 0xCB | 0xCD | 0xCE | 0xCF
+            0xC0 | 0xC1
+                | 0xC2
+                | 0xC3
+                | 0xC5
+                | 0xC6
+                | 0xC7
+                | 0xC9
+                | 0xCA
+                | 0xCB
+                | 0xCD
+                | 0xCE
+                | 0xCF
         ) {
             if index + 9 > bytes.len() {
                 return None;

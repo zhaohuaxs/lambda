@@ -8,7 +8,6 @@
 //! `Table.selection`、以及将来的任务记录之间保持一致，自增序号在「删一个再加
 //! 一个」之后会复用，哈希不会。
 
-use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -92,8 +91,7 @@ pub fn id_of(uri: &str) -> i64 {
 }
 
 pub fn load() -> Vec<Record> {
-    let text = fs::read_to_string(store_path()).unwrap_or_default();
-    let value: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+    let value = crate::store::read_json(&store_path()).unwrap_or(serde_json::Value::Null);
     value
         .as_array()
         .map(|items| items.iter().filter_map(Record::from_value).collect())
@@ -102,11 +100,7 @@ pub fn load() -> Vec<Record> {
 
 pub fn save(items: &[Record]) -> Result<(), String> {
     let array = serde_json::Value::Array(items.iter().map(Record::to_value).collect());
-    let text = serde_json::to_string_pretty(&array).map_err(|error| error.to_string())?;
-    if let Some(parent) = store_path().parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    fs::write(store_path(), text).map_err(|error| format!("写入目录表失败：{error}"))
+    crate::store::write_json(&store_path(), &array)
 }
 
 /// 添加或更新（按 URI 去重）。已存在时保留原来的 `added_at`，因为「添加时间」
@@ -137,7 +131,10 @@ mod tests {
         let a = id_of("content://tree/a");
         assert_eq!(a, id_of("content://tree/a"));
         assert_ne!(a, id_of("content://tree/b"));
-        assert!(a > 0, "ids stay positive so they survive the trip to a Kotlin Long");
+        assert!(
+            a > 0,
+            "ids stay positive so they survive the trip to a Kotlin Long"
+        );
     }
 
     #[test]

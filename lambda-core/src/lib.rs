@@ -26,13 +26,14 @@ pub mod probe;
 pub mod recent;
 pub mod record;
 mod settings;
+mod store;
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+use bern::CommandError;
 use bern::files;
 use bern::media::MediaSource;
-use bern::CommandError;
 use lambda_protocol::lambda::{self, Commands, State};
 
 use archive::Sort as ArchiveSort;
@@ -69,6 +70,15 @@ struct OpenArchive {
     descending: bool,
     password: Option<String>,
     encrypted: bool,
+}
+
+impl Drop for OpenArchive {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        if let Some(password) = self.password.as_mut() {
+            password.zeroize();
+        }
+    }
 }
 
 /// 加密归档在等密码时，临时副本还不能删——解开后还要列目录。
@@ -124,7 +134,7 @@ struct ImagePreview {
 }
 
 impl Preview {
-    fn stop(&self) {
+    fn stop(&mut self) {
         match self {
             Preview::Text(session) => session.stop(),
             Preview::Image(image) => image.session.stop(),
@@ -299,8 +309,7 @@ impl lambda::Commands for LambdaEngine {
     }
 
     fn remove_location(&mut self, id: i64) -> Result<(), CommandError> {
-        self.table =
-            locations::remove(id).map_err(|error| CommandError::new("location", error))?;
+        self.table = locations::remove(id).map_err(|error| CommandError::new("location", error))?;
         self.stale.remove(&id);
         if self.current_location() == Some(id) {
             self.stack.clear();
@@ -340,7 +349,10 @@ impl lambda::Commands for LambdaEngine {
             )
         };
         // 当前目录若已失效，条目也要跟着清掉，否则界面会显示一页点不动的行。
-        if self.current_location().is_some_and(|id| self.stale.contains(&id)) {
+        if self
+            .current_location()
+            .is_some_and(|id| self.stale.contains(&id))
+        {
             self.items.clear();
             self.rebuild();
         }
@@ -472,9 +484,9 @@ impl lambda::Commands for LambdaEngine {
     fn boundary(&mut self) -> Result<(), CommandError> {
         self.state.busy = true;
         self.state.status = "边界补测运行中（异常归档 + 32 MB 计时）…".into();
-        // 报告的公有出口就是当前位置的树根：`export_path` 只能写树根。
-        let root = self.stack.first().map(|step| step.url.clone());
-        let report = probe::run(root.as_deref());
+        // 报告只写私有目录：自动导出到公有 SAF 树根会把私有路径与测试
+        // 细节放进用户可见的目录，需要时由诊断流程显式取。
+        let report = probe::run(None);
         self.state.busy = false;
         self.state.status = report
             .lines()
@@ -537,6 +549,12 @@ impl lambda::Commands for LambdaEngine {
                 "上次的任务带密码，密码不落盘：先在密码框里填上再重试",
             ));
         }
+        if saved.root.is_empty() {
+            return Err(CommandError::new(
+                "job",
+                "上次任务的导出目标已经失效：重新选一个目录再压缩",
+            ));
+        }
         let inputs: Vec<compress::Input> = saved
             .inputs
             .iter()
@@ -555,7 +573,7 @@ impl lambda::Commands for LambdaEngine {
             level: saved.level.min(9),
             password,
             root: saved.root.clone(),
-            name: saved.name.clone(),
+            name: backend::file_component(&saved.name),
         };
         // 格式与级别跟着记录走，界面上的按钮也要跟着变，不然下一句话就和
         // 实际发生的事对不上。
@@ -603,11 +621,13 @@ impl lambda::Commands for LambdaEngine {
         self.stage_open(record.name, record.url, record.size, password, secret)
     }
 
-    fn unlock_archive(
-        &mut self,
-        password: String,
-        secret: String,
-    ) -> Result<(), CommandError> {
+    fn unlock_archive(&mut self, password: String, secret: String) -> Result<(), CommandError> {
+        if self.job.is_some() {
+            return Err(CommandError::new(
+                "job_busy",
+                "已有任务在运行：等它结束，或先取消",
+            ));
+        }
         let Some(pending) = self.pending.as_ref() else {
             return Err(CommandError::new("archive", "没有等待解锁的归档"));
         };
@@ -652,7 +672,10 @@ impl lambda::Commands for LambdaEngine {
 
     fn archive_enter(&mut self, id: i64) -> Result<(), CommandError> {
         let Some(item) = self.layer_items().into_iter().find(|item| item.id == id) else {
-            return Err(CommandError::new("archive", "这一项已经不在归档的当前层里了"));
+            return Err(CommandError::new(
+                "archive",
+                "这一项已经不在归档的当前层里了",
+            ));
         };
         if !item.folder {
             self.state.status = format!("「{}」是文件：勾选它可以解压", item.name);
@@ -786,12 +809,7 @@ impl lambda::Commands for LambdaEngine {
         Ok(())
     }
 
-    fn extract(
-        &mut self,
-        all: bool,
-        password: String,
-        secret: String,
-    ) -> Result<(), CommandError> {
+    fn extract(&mut self, all: bool, password: String, secret: String) -> Result<(), CommandError> {
         if self.job.is_some() {
             return Err(CommandError::new(
                 "job_busy",
@@ -832,10 +850,9 @@ impl lambda::Commands for LambdaEngine {
                 .clone()
                 .ok_or_else(|| CommandError::new("extract", "先选一个目标目录"))?
         } else {
-            let step = self
-                .stack
-                .first()
-                .ok_or_else(|| CommandError::new("extract", "先选一个目录：解压结果要落到它里面"))?;
+            let step = self.stack.first().ok_or_else(|| {
+                CommandError::new("extract", "先选一个目录：解压结果要落到它里面")
+            })?;
             (step.url.clone(), step.name.clone())
         };
         let typed = self.solve_password(password, secret)?;
@@ -853,7 +870,7 @@ impl lambda::Commands for LambdaEngine {
         let paths = if all && prefix.is_empty() {
             Vec::new()
         } else if all {
-            vec![prefix]
+            vec![prefix.clone()]
         } else {
             chosen.iter().map(|item| item.path.clone()).collect()
         };
@@ -861,9 +878,52 @@ impl lambda::Commands for LambdaEngine {
             .iter()
             .map(|item| extract::Output {
                 path: item.path.clone(),
-                folder: item.folder,
             })
             .collect::<Vec<_>>();
+        let link_name = if all {
+            self.archive.as_ref().and_then(|archive| {
+                archive
+                    .entries
+                    .iter()
+                    .find(|entry| {
+                        entry.link
+                            && (prefix.is_empty()
+                                || entry.path == prefix
+                                || entry.path.starts_with(&format!("{prefix}/")))
+                    })
+                    .map(|entry| entry.path.clone())
+            })
+        } else {
+            chosen
+                .iter()
+                .find(|item| item.link)
+                .map(|item| item.path.clone())
+        };
+        if let Some(path) = link_name {
+            return Err(CommandError::new(
+                "extract",
+                format!("归档里的链接条目不支持解压：{path}"),
+            ));
+        }
+        let (declared_bytes, entry_count) = self
+            .archive
+            .as_ref()
+            .map(|archive| {
+                archive
+                    .entries
+                    .iter()
+                    .filter(|entry| !entry.folder)
+                    .filter(|entry| {
+                        outputs.iter().any(|output| {
+                            entry.path == output.path
+                                || entry.path.starts_with(&format!("{}/", output.path))
+                        })
+                    })
+                    .fold((0u64, 0usize), |(bytes, count), entry| {
+                        (bytes.saturating_add(entry.size), count + 1)
+                    })
+            })
+            .unwrap_or((0, 0));
         if let Some(archive) = self.archive.as_mut()
             && archive.password.is_none()
             && !password.is_empty()
@@ -876,6 +936,8 @@ impl lambda::Commands for LambdaEngine {
             password,
             paths,
             outputs,
+            declared_bytes,
+            entry_count,
             root,
             target_label: target_label.clone(),
             policy,
@@ -893,11 +955,7 @@ impl lambda::Commands for LambdaEngine {
         self.compress_selected(Some(name), password, secret)
     }
 
-    fn save_password(
-        &mut self,
-        label: String,
-        password: String,
-    ) -> Result<(), CommandError> {
+    fn save_password(&mut self, label: String, password: String) -> Result<(), CommandError> {
         let record = passwords::save(&label, &password)?;
         self.passwords = passwords::load();
         self.sync_passwords();
@@ -931,10 +989,27 @@ impl lambda::Commands for LambdaEngine {
             return Err(CommandError::new("archive", "请先选择一个归档文件"));
         }
         let title = file.file_name().unwrap_or_else(|| "archive".into());
+        if !browser::is_archive(&title) {
+            return Err(CommandError::new(
+                "archive",
+                format!("Lambda 不打开这种文件：{title}"),
+            ));
+        }
         let size = match file.open() {
             Ok(source) => source.len(),
             Err(error) => return Err(error),
         };
+        let limit: u64 = if cfg!(target_os = "android") {
+            4 * 1024 * 1024 * 1024
+        } else {
+            16 * 1024 * 1024 * 1024
+        };
+        if size > limit {
+            return Err(CommandError::new(
+                "archive",
+                format!("归档太大（{}），暂不打开", browser::size_text(size)),
+            ));
+        }
         self.stage_open(title, file.url, size, password, secret)
     }
 
@@ -1046,7 +1121,8 @@ impl lambda::Commands for LambdaEngine {
             }));
             self.sync_preview();
         } else {
-            let session = preview::start(local, password, item.path, title.clone(), item.size, waker);
+            let session =
+                preview::start(local, password, item.path, title.clone(), item.size, waker);
             self.preview = Some(Preview::Text(session));
             self.state.preview_open = true;
             self.state.preview_is_image = false;
@@ -1110,6 +1186,12 @@ impl LambdaEngine {
         password: String,
         secret: String,
     ) -> Result<(), CommandError> {
+        if self.job.is_some() {
+            return Err(CommandError::new(
+                "job_busy",
+                "已有任务在运行：等它结束，或先取消",
+            ));
+        }
         let password = self.solve_password(password, secret)?;
         self.cleanup_archive();
         self.archive = None;
@@ -1118,13 +1200,10 @@ impl LambdaEngine {
         self.state.archive_lock_text.clear();
         self.sync_archive();
 
-        let dir = backend::scratch().join(format!("open-{}", stamp()));
-        if let Err(error) = std::fs::create_dir_all(&dir) {
-            return Err(CommandError::new(
-                "archive",
-                format!("无法创建工作目录：{error}"),
-            ));
-        }
+        let dir = match backend::fresh_dir("open") {
+            Ok(dir) => dir,
+            Err(message) => return Err(CommandError::new("archive", message)),
+        };
         let local = match backend::copy_file_to(&url, &dir) {
             Ok(local) => local,
             Err(message) => {
@@ -1141,12 +1220,14 @@ impl LambdaEngine {
             let _ = std::fs::remove_dir_all(&dir);
             None
         };
-        let size = size.max(std::fs::metadata(&local).map(|meta| meta.len()).unwrap_or(0));
-
-        let attempt = backend::list_entries(
-            &local,
-            (!password.is_empty()).then_some(password.as_str()),
+        let size = size.max(
+            std::fs::metadata(&local)
+                .map(|meta| meta.len())
+                .unwrap_or(0),
         );
+
+        let attempt =
+            backend::list_entries(&local, (!password.is_empty()).then_some(password.as_str()));
         match attempt {
             Ok(entries) => {
                 self.finish_open(title, url, local, owned, size, entries, password);
@@ -1211,17 +1292,21 @@ impl LambdaEngine {
 
     /// 删掉临时副本（复制出来的才删；桌面上打开的是原文件）。
     fn cleanup_archive(&mut self) {
-        // 预览的 7z 进程还在读这份 staging：先停掉，再删目录。
+        // 预览的 7z 进程还在读这份 staging：先停掉并等它退出，再删目录。
         self.stop_preview();
         if let Some(archive) = self.archive.take()
-            && let Some(dir) = archive.owned
+            && let Some(dir) = archive.owned.as_deref()
+            && let Err(error) = std::fs::remove_dir_all(dir)
+            && error.kind() != std::io::ErrorKind::NotFound
         {
-            let _ = std::fs::remove_dir_all(dir);
+            self.state.status = format!("无法清理临时目录 {}：{error}", dir.display());
         }
         if let Some(pending) = self.pending.take()
             && let Some(dir) = pending.owned
+            && let Err(error) = std::fs::remove_dir_all(&dir)
+            && error.kind() != std::io::ErrorKind::NotFound
         {
-            let _ = std::fs::remove_dir_all(dir);
+            self.state.status = format!("无法清理临时目录 {}：{error}", dir.display());
         }
     }
 
@@ -1295,17 +1380,17 @@ impl LambdaEngine {
         } else {
             format!("{} / {}", title, prefix.join(" / "))
         };
-        self.state.archive_crumbs = std::iter::once(lambda::ArchiveCrumb {
-            id: 0,
-            name: title,
-        })
-        .chain(prefix.iter().enumerate().map(|(index, name)| {
-            lambda::ArchiveCrumb {
-                id: index as i64 + 1,
-                name: name.clone(),
-            }
-        }))
-        .collect();
+        self.state.archive_crumbs = std::iter::once(lambda::ArchiveCrumb { id: 0, name: title })
+            .chain(
+                prefix
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| lambda::ArchiveCrumb {
+                        id: index as i64 + 1,
+                        name: name.clone(),
+                    }),
+            )
+            .collect();
         self.state.archive_entries = items
             .iter()
             .map(|item| lambda::ArchiveEntry {
@@ -1373,8 +1458,7 @@ impl LambdaEngine {
         self.state.archive_selected = selected.len() as i64;
         self.state.archive_selected_bytes = bytes as i64;
         self.state.archive_selected_text = browser::size_text(bytes);
-        self.state.archive_select_all_label = if !items.is_empty()
-            && selected.len() == items.len()
+        self.state.archive_select_all_label = if !items.is_empty() && selected.len() == items.len()
         {
             CLEAR_ALL.into()
         } else {
@@ -1389,7 +1473,7 @@ impl LambdaEngine {
     }
 
     fn stop_preview(&mut self) {
-        if let Some(session) = self.preview.take() {
+        if let Some(mut session) = self.preview.take() {
             session.stop();
         }
         self.reset_preview_state();
@@ -1442,7 +1526,11 @@ impl LambdaEngine {
                         "—".into()
                     }
                 } else if snapshot.done {
-                    format!("第 {} / {} 页", snapshot.page, snapshot.pages.max(snapshot.page))
+                    format!(
+                        "第 {} / {} 页",
+                        snapshot.page,
+                        snapshot.pages.max(snapshot.page)
+                    )
                 } else {
                     // 总页数要到读完才知道；加载中只报当前页，避免「第 1 / 4 页」
                     // 随预读增长而跳变。读取进度在下面的状态行。
@@ -1475,11 +1563,8 @@ impl LambdaEngine {
                 self.state.preview_image = image.session.url();
                 self.state.preview_text.clear();
                 self.state.preview_page = 0;
-                self.state.preview_page_text = format!(
-                    "第 {} / {} 张",
-                    image.index + 1,
-                    image.items.len().max(1)
-                );
+                self.state.preview_page_text =
+                    format!("第 {} / {} 张", image.index + 1, image.items.len().max(1));
                 self.state.preview_has_prev = image.index > 0;
                 self.state.preview_has_next = image.index + 1 < image.items.len();
                 self.state.preview_encoding.clear();
@@ -1520,10 +1605,8 @@ impl LambdaEngine {
         };
         self.state.extract_target_text = text;
         self.state.extract_has_target = ready;
-        self.state.can_extract = self.archive.is_some()
-            && self.job.is_none()
-            && ready
-            && (policy != 0 || at_root);
+        self.state.can_extract =
+            self.archive.is_some() && self.job.is_none() && ready && (policy != 0 || at_root);
     }
 
     fn sync_recent(&mut self) {
@@ -1556,11 +1639,7 @@ impl LambdaEngine {
 
     /// 密码簿 id 一旦不可用就报错，而不是悄悄退回手输：用户选的是「这条
     /// 保存的密码」，用别的密码去开会让失败原因对不上。
-    fn solve_password(
-        &self,
-        typed: String,
-        secret: String,
-    ) -> Result<String, CommandError> {
+    fn solve_password(&self, typed: String, secret: String) -> Result<String, CommandError> {
         if secret.is_empty() {
             return Ok(typed);
         }
@@ -1645,7 +1724,10 @@ impl LambdaEngine {
         // 7-Zip 调用串行：预览还开着就先收掉，避免任务排在它后面。
         self.stop_preview();
         let Some(waker) = bern::wake::waker() else {
-            return Err(CommandError::new("job", "引擎没有 waker，任务无法在后台运行"));
+            return Err(CommandError::new(
+                "job",
+                "引擎没有 waker，任务无法在后台运行",
+            ));
         };
         let title = format!("解压 {total} 项");
         let shared = std::sync::Arc::new(std::sync::Mutex::new(Job::new(title.clone(), total)));
@@ -1678,7 +1760,10 @@ impl LambdaEngine {
     ) -> Result<(), CommandError> {
         self.stop_preview();
         let Some(waker) = bern::wake::waker() else {
-            return Err(CommandError::new("job", "引擎没有 waker，任务无法在后台运行"));
+            return Err(CommandError::new(
+                "job",
+                "引擎没有 waker，任务无法在后台运行",
+            ));
         };
         let total = inputs.len() as i64;
         let title = format!("压缩 {total} 项");
@@ -1778,7 +1863,11 @@ impl LambdaEngine {
     /// 「全选」/「全不选」：当前页是否已经全选中。
     fn select_all_text(&self) -> String {
         let all = !self.items.is_empty() && self.selected_ids.len() == self.items.len();
-        if all { CLEAR_ALL.into() } else { SELECT_ALL.into() }
+        if all {
+            CLEAR_ALL.into()
+        } else {
+            SELECT_ALL.into()
+        }
     }
 
     /// 把选中的 id 投影成计数与合计字节；已经不存在的 id 直接丢掉。
@@ -1867,7 +1956,10 @@ impl LambdaEngine {
         // 空表要有话说：真机上删掉目录后只剩表头，什么都点不动也没解释。
         self.state.empty_text = if !self.items.is_empty() {
             String::new()
-        } else if self.current_location().is_some_and(|id| self.stale.contains(&id)) {
+        } else if self
+            .current_location()
+            .is_some_and(|id| self.stale.contains(&id))
+        {
             "目录授权已失效：点上面那个 ↻ 重新授权".into()
         } else if self.table.is_empty() {
             "还没有目录：点「＋ 目录」选一个文件夹".into()
@@ -1951,14 +2043,6 @@ fn mark(chosen: bool) -> &'static str {
     if chosen { "✓" } else { "○" }
 }
 
-/// 临时工作目录的唯一后缀：毫秒时间戳。归档浏览与任务串行，够用。
-fn stamp() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis())
-        .unwrap_or(0)
-}
-
 /// `-mx` 的档位名。0 是「仅存储」，7–9 都算极限——界面只给三档，
 /// 这里仍按值映射，CLI 传任意 0–9 也能显示成一句人话。
 fn level_text(level: i64) -> String {
@@ -2006,8 +2090,13 @@ impl lambda::Engine for LambdaEngine {
     /// 只做一次快照拷贝，不碰磁盘。只有任务真的结束（`outcome` 有值）时
     /// 才刷新目录——产物已经在位置的根上，刷新是为了让它出现在列表里。
     fn wake(&mut self) {
-        self.open_handed_files();
         self.sync_job();
+        // Handed files would make `list_entries` wait on the engine mutex
+        // until the running job returns, freezing the UI thread. Hold them
+        // until the job slot is empty; the completion tick consumes them.
+        if self.job.is_none() {
+            self.open_handed_files();
+        }
         if self.preview.is_some() {
             self.sync_preview();
         }
@@ -2076,7 +2165,11 @@ impl LambdaEngine {
         let (message, refresh) = match outcome {
             Outcome::Done(message) => (message, true),
             Outcome::Failed(message) => {
-                let prefix = if was_extract { "解压失败" } else { "压缩失败" };
+                let prefix = if was_extract {
+                    "解压失败"
+                } else {
+                    "压缩失败"
+                };
                 (format!("{prefix}：{message}"), true)
             }
             Outcome::Cancelled if was_extract => {
@@ -2179,7 +2272,12 @@ mod tests {
         engine.toggle(c).unwrap();
         assert_eq!(engine.state.selected, 2);
         assert_eq!(engine.state.selected_bytes, 400);
-        let marks: Vec<&str> = engine.state.entries.iter().map(|entry| entry.mark.as_str()).collect();
+        let marks: Vec<&str> = engine
+            .state
+            .entries
+            .iter()
+            .map(|entry| entry.mark.as_str())
+            .collect();
         assert_eq!(marks, ["✓", "○", "✓"]);
         engine.toggle(a).unwrap();
         assert_eq!(engine.state.selected, 1);
@@ -2188,10 +2286,7 @@ mod tests {
 
     #[test]
     fn select_all_flips_both_ways() {
-        let mut engine = engine(vec![
-            item("a.bin", false, 10),
-            item("b.bin", false, 20),
-        ]);
+        let mut engine = engine(vec![item("a.bin", false, 10), item("b.bin", false, 20)]);
         assert_eq!(engine.state.select_all_label, SELECT_ALL);
         engine.select_all().unwrap();
         assert_eq!(engine.state.selected, 2);

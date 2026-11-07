@@ -21,6 +21,9 @@ pub struct Item {
     pub folder: bool,
     pub size: u64,
     pub encrypted: bool,
+    /// A symbolic or hard link. Extraction refuses these instead of letting a
+    /// later entry write through the link.
+    pub link: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,7 +67,6 @@ pub fn password_error(message: &str) -> bool {
         || message.contains("密码")
         || lower.contains("encrypted")
         || lower.contains("break signaled")
-        || lower.contains("headers error")
 }
 
 /// 当前层的直接子项。`prefix` 形如 `""` 或 `"sub/"`。
@@ -97,6 +99,7 @@ pub fn layer(entries: &[ListedEntry], prefix: &str) -> Vec<Item> {
             folder: false,
             size: 0,
             encrypted: false,
+            link: false,
         });
         if deeper || entry.folder {
             item.folder = true;
@@ -106,6 +109,9 @@ pub fn layer(entries: &[ListedEntry], prefix: &str) -> Vec<Item> {
         }
         if entry.encrypted {
             item.encrypted = true;
+        }
+        if entry.link {
+            item.link = true;
         }
     }
     map.into_values().collect()
@@ -130,11 +136,58 @@ pub fn sort(items: &mut [Item], by: Sort, descending: bool) {
 /// 没有后缀的 README / LICENSE 这类也放进来。
 pub fn is_text(name: &str) -> bool {
     const EXTENSIONS: &[&str] = &[
-        "txt", "text", "md", "markdown", "rst", "log", "csv", "tsv", "json", "jsonl", "xml",
-        "html", "htm", "xhtml", "svg", "css", "js", "mjs", "cjs", "ts", "tsx", "jsx", "yml",
-        "yaml", "toml", "ini", "cfg", "conf", "properties", "sh", "bash", "zsh", "bat", "cmd",
-        "ps1", "sql", "rs", "c", "h", "cc", "cpp", "hpp", "py", "java", "kt", "kts", "gradle",
-        "srt", "vtt", "tex", "diff", "patch",
+        "txt",
+        "text",
+        "md",
+        "markdown",
+        "rst",
+        "log",
+        "csv",
+        "tsv",
+        "json",
+        "jsonl",
+        "xml",
+        "html",
+        "htm",
+        "xhtml",
+        "svg",
+        "css",
+        "js",
+        "mjs",
+        "cjs",
+        "ts",
+        "tsx",
+        "jsx",
+        "yml",
+        "yaml",
+        "toml",
+        "ini",
+        "cfg",
+        "conf",
+        "properties",
+        "sh",
+        "bash",
+        "zsh",
+        "bat",
+        "cmd",
+        "ps1",
+        "sql",
+        "rs",
+        "c",
+        "h",
+        "cc",
+        "cpp",
+        "hpp",
+        "py",
+        "java",
+        "kt",
+        "kts",
+        "gradle",
+        "srt",
+        "vtt",
+        "tex",
+        "diff",
+        "patch",
     ];
     const NAMES: &[&str] = &[
         "readme",
@@ -188,6 +241,7 @@ mod tests {
             size,
             folder,
             encrypted: false,
+            link: false,
         }
     }
 
@@ -231,6 +285,7 @@ mod tests {
                 folder: false,
                 size: 9,
                 encrypted: false,
+                link: false,
             },
             Item {
                 id: 2,
@@ -239,6 +294,7 @@ mod tests {
                 folder: true,
                 size: 0,
                 encrypted: false,
+                link: false,
             },
         ];
         sort(&mut items, Sort::Size, true);
@@ -272,9 +328,13 @@ mod tests {
 
     #[test]
     fn a_password_prompt_reads_as_a_password_problem() {
-        assert!(password_error("Cannot open encrypted archive. Wrong password?"));
+        assert!(password_error(
+            "Cannot open encrypted archive. Wrong password?"
+        ));
         assert!(password_error("需要密码：这个归档已加密"));
-        assert!(password_error("Headers Error"));
+        // A corrupt plain archive also reports "Headers Error"; prompting for
+        // a password would send the user down the wrong path.
+        assert!(!password_error("Headers Error"));
         assert!(!password_error("Cannot open the file as [7z] archive"));
     }
 }

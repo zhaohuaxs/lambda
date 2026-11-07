@@ -855,6 +855,7 @@ name = "lambda-cli"
 version = "0.1.0"
 dependencies = [
  "sevenzip-src",
+ "zeroize",
 ]
 
 [[package]]
@@ -865,8 +866,10 @@ dependencies = [
  "chardet-rs",
  "encoding_rs",
  "lambda-protocol",
+ "libc",
  "serde_json",
  "sevenzip-src",
+ "zeroize",
 ]
 
 [[package]]

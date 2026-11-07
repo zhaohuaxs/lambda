@@ -193,18 +193,29 @@ mod tests {
 
     #[test]
     fn folders_come_first_in_both_directions() {
-        let mut items = vec![item("a.txt", false, 3), item("dir", true, 0), item("b.txt", false, 9)];
+        let mut items = vec![
+            item("a.txt", false, 3),
+            item("dir", true, 0),
+            item("b.txt", false, 9),
+        ];
         sort(&mut items, Sort::Size, false);
         assert_eq!(items[0].name, "dir");
         assert_eq!(items[1].name, "a.txt");
         sort(&mut items, Sort::Size, true);
-        assert_eq!(items[0].name, "dir", "a descending size still lists folders first");
+        assert_eq!(
+            items[0].name, "dir",
+            "a descending size still lists folders first"
+        );
         assert_eq!(items[1].name, "b.txt");
     }
 
     #[test]
     fn names_with_numbers_sort_naturally() {
-        let mut items = vec![item("IMG_10.jpg", false, 10), item("IMG_2.jpg", false, 2), item("img_1.jpg", false, 1)];
+        let mut items = vec![
+            item("IMG_10.jpg", false, 10),
+            item("IMG_2.jpg", false, 2),
+            item("img_1.jpg", false, 1),
+        ];
         sort(&mut items, Sort::Name, false);
         let names: Vec<&str> = items.iter().map(|item| item.name.as_str()).collect();
         assert_eq!(names, ["img_1.jpg", "IMG_2.jpg", "IMG_10.jpg"]);

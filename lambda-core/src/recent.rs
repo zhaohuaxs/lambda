@@ -68,8 +68,7 @@ impl Record {
 }
 
 pub fn load() -> Vec<Record> {
-    let text = fs::read_to_string(store_path()).unwrap_or_default();
-    let value: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+    let value = crate::store::read_json(&store_path()).unwrap_or(serde_json::Value::Null);
     let mut records: Vec<Record> = value
         .as_array()
         .map(|items| items.iter().filter_map(Record::from_value).collect())
@@ -80,11 +79,8 @@ pub fn load() -> Vec<Record> {
 
 fn save(records: &[Record]) -> Result<(), String> {
     let array = serde_json::Value::Array(records.iter().map(Record::to_value).collect());
-    let text = serde_json::to_string_pretty(&array).map_err(|error| error.to_string())?;
-    if let Some(parent) = store_path().parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    fs::write(store_path(), text).map_err(|error| format!("写入最近记录失败：{error}"))
+    crate::store::write_json(&store_path(), &array)
+        .map_err(|error| format!("写入最近记录失败：{error}"))
 }
 
 /// 打开成功后记一笔：同一条 URL 只留一行，排到最前，最多 20 条。

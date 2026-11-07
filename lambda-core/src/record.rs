@@ -37,7 +37,10 @@ impl SavedInput {
         Some(Self {
             name: value.get("name")?.as_str()?.to_string(),
             url: value.get("url")?.as_str()?.to_string(),
-            folder: value.get("folder").and_then(|v| v.as_bool()).unwrap_or(false),
+            folder: value
+                .get("folder")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
         })
     }
 }
@@ -139,7 +142,10 @@ impl Saved {
                 .unwrap_or("压缩包")
                 .to_string(),
             root: value.get("root").and_then(|v| v.as_str())?.to_string(),
-            locked: value.get("locked").and_then(|v| v.as_bool()).unwrap_or(false),
+            locked: value
+                .get("locked")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             inputs,
             started: value.get("started").and_then(|v| v.as_u64()).unwrap_or(0),
         })
@@ -168,7 +174,9 @@ fn now_secs() -> u64 {
 }
 
 fn path() -> PathBuf {
-    crate::locations::data_root().join("jobs").join("current.json")
+    crate::locations::data_root()
+        .join("jobs")
+        .join("current.json")
 }
 
 /// 任务开始：先落盘，再起工作线程。顺序反了就没有「进程被杀也留痕」。
@@ -179,7 +187,7 @@ pub fn begin(saved: &Saved) {
         return;
     }
     let text = serde_json::to_string_pretty(&saved.to_value()).unwrap_or_default();
-    let _ = fs::write(path, text);
+    let _ = crate::backend::write_atomic(&path, text.as_bytes());
 }
 
 /// 换阶段时更新一次；记录被人删掉就什么也不做。
@@ -200,8 +208,7 @@ pub fn finish() {
 
 /// 启动时读一次。读到什么就说明上次没走到 `finish()`。
 pub fn load() -> Option<Saved> {
-    let text = fs::read_to_string(path()).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let value = crate::store::read_json(&path())?;
     Saved::from_value(&value)
 }
 

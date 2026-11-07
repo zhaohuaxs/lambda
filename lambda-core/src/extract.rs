@@ -13,7 +13,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use bern::media::MediaSource;
 use bern::wake::Waker;
@@ -23,10 +23,17 @@ use crate::job::{Job, Outcome, Shared, Ticker};
 
 const WAKE_INTERVAL: Duration = Duration::from_millis(150);
 
+/// Refuse archives whose declared output is absurd before the engine writes
+/// anything. 7-Zip reports every entry's size in the listing Lambda already
+/// holds, so this costs nothing.
+const MAX_ENTRY_COUNT: usize = 200_000;
+const BOMB_RATIO: u64 = 1_000;
+const BOMB_SLACK: u64 = 64 * 1024 * 1024;
+const FREE_SPACE_RESERVE: u64 = 256 * 1024 * 1024;
+
 /// 当前层里被选中的一项。`path` 是归档内的完整路径。
 pub struct Output {
     pub path: String,
-    pub folder: bool,
 }
 
 pub struct Plan {
@@ -38,6 +45,10 @@ pub struct Plan {
     pub paths: Vec<String>,
     /// 导出时要落到目标根的顶层项。
     pub outputs: Vec<Output>,
+    /// 被选条目声明的总字节数（含文件夹的后代）。
+    pub declared_bytes: u64,
+    /// 被选中文件的条目数（含文件夹的后代）。
+    pub entry_count: usize,
     /// 目标 SAF 树根 / 桌面目录。
     pub root: String,
     /// 「下载」「lambda-m0」这类目标名，写进结果消息。
@@ -46,6 +57,13 @@ pub struct Plan {
     pub policy: i64,
     /// 归档名（不含扩展名），套目录时用。
     pub stem: String,
+}
+
+impl Drop for Plan {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.password.zeroize();
+    }
 }
 
 pub fn start(job: Shared, waker: Waker, plan: Plan) {
@@ -59,15 +77,53 @@ pub fn start(job: Shared, waker: Waker, plan: Plan) {
 }
 
 fn run(job: &Shared, waker: &Waker, plan: Plan) -> Outcome {
-    let staging = backend::scratch().join(format!("job-{}", stamp()));
+    let staging = match backend::fresh_dir("job") {
+        Ok(staging) => staging,
+        Err(message) => return Outcome::Failed(message),
+    };
     let out = staging.join("extracted");
-    let outcome = match extract(job, waker, &plan, &out) {
-        Ok(bytes) => export(job, waker, &plan, &staging, &out, bytes),
+    let outcome = match gate(&plan, &staging) {
+        Ok(()) => match extract(job, waker, &plan, &out) {
+            Ok(bytes) => export(job, waker, &plan, &staging, &out, bytes),
+            Err(Failure::Cancelled) => Outcome::Cancelled,
+            Err(Failure::Message(message)) => Outcome::Failed(message),
+        },
         Err(Failure::Cancelled) => Outcome::Cancelled,
         Err(Failure::Message(message)) => Outcome::Failed(message),
     };
     let _ = fs::remove_dir_all(&staging);
     outcome
+}
+
+fn gate(plan: &Plan, staging: &Path) -> Result<(), Failure> {
+    if plan.entry_count > MAX_ENTRY_COUNT {
+        return Err(Failure::Message(format!(
+            "归档条目超过 {MAX_ENTRY_COUNT} 项，暂不解压"
+        )));
+    }
+    let archive_bytes = fs::metadata(&plan.archive)
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    let budget = archive_bytes
+        .saturating_mul(BOMB_RATIO)
+        .saturating_add(BOMB_SLACK);
+    if plan.declared_bytes > budget {
+        return Err(Failure::Message(format!(
+            "疑似解压炸弹：条目声明 {} 字节，归档只有 {} 字节",
+            crate::browser::size_text(plan.declared_bytes),
+            crate::browser::size_text(archive_bytes)
+        )));
+    }
+    if let Some(free) = backend::free_space(staging)
+        && plan.declared_bytes > free.saturating_sub(FREE_SPACE_RESERVE)
+    {
+        return Err(Failure::Message(format!(
+            "空间不足：需要 {}，可用 {}",
+            crate::browser::size_text(plan.declared_bytes),
+            crate::browser::size_text(free)
+        )));
+    }
+    Ok(())
 }
 
 enum Failure {
@@ -95,12 +151,12 @@ fn extract(job: &Shared, waker: &Waker, plan: &Plan, out: &Path) -> Result<u64, 
     let password = (!plan.password.is_empty()).then_some(plan.password.as_str());
     let bytes = backend::extract_entries(&plan.archive, password, out, &plan.paths, slot, cancel)
         .map_err(|message| {
-            if message == "已取消" {
-                Failure::Cancelled
-            } else {
-                Failure::Message(message)
-            }
-        })?;
+        if message == "已取消" {
+            Failure::Cancelled
+        } else {
+            Failure::Message(message)
+        }
+    })?;
     if job.lock().map(|guard| guard.cancelled()).unwrap_or(false) {
         return Err(Failure::Cancelled);
     }
@@ -130,11 +186,10 @@ fn export(
         // 直接落进目标根；选中多项时才用归档名包起来。
         1 if sources.len() == 1 => {
             if sources[0].is_dir() {
-                let children = children_of(&sources[0]);
-                if children.is_empty() {
-                    (sources, false)
-                } else {
-                    (children, false)
+                match children_of(&sources[0]) {
+                    Ok(children) if !children.is_empty() => (children, false),
+                    Ok(_) => (sources, false),
+                    Err(message) => return Outcome::Failed(message),
                 }
             } else {
                 (sources, false)
@@ -163,26 +218,38 @@ fn export(
         }
     }
     let what = if wrapped {
-        format!("{} 项到「{}」/{}/", plan.outputs.len(), plan.target_label, plan.stem)
+        format!(
+            "{} 项到「{}」/{}/",
+            plan.outputs.len(),
+            plan.target_label,
+            plan.stem
+        )
     } else {
         format!("{} 项到「{}」", plan.outputs.len(), plan.target_label)
     };
-    Outcome::Done(format!("已解压 {what}（{}）", crate::browser::size_text(bytes)))
+    Outcome::Done(format!(
+        "已解压 {what}（{}）",
+        crate::browser::size_text(bytes)
+    ))
 }
 
 /// 每个顶层项在 staging 里的本地路径。文件夹即使没有显式目录项，7-Zip 也会
-/// 建出来；真没有时补一个空目录，语义上仍然是「解压了这个文件夹」。
+/// 建出来；真没有就是解压失败，绝不能伪造一个空目录然后报「已解压」。
 fn sources(plan: &Plan, out: &Path) -> Result<Vec<PathBuf>, String> {
+    let root = out
+        .canonicalize()
+        .map_err(|error| format!("无法定位解压目录 {}：{error}", out.display()))?;
     let mut sources = Vec::new();
     for output in &plan.outputs {
         let local = out.join(output.path.replace('\\', "/"));
         if !local.exists() {
-            if output.folder {
-                fs::create_dir_all(&local)
-                    .map_err(|error| format!("无法创建 {}：{error}", local.display()))?;
-            } else {
-                return Err(format!("归档里没有这一项：{}", output.path));
-            }
+            return Err(format!("归档里没有这一项：{}", output.path));
+        }
+        let local = local
+            .canonicalize()
+            .map_err(|error| format!("无法定位 {}：{error}", local.display()))?;
+        if !local.starts_with(&root) {
+            return Err(format!("归档条目落在解压目录之外：{}", output.path));
         }
         sources.push(local);
     }
@@ -192,44 +259,44 @@ fn sources(plan: &Plan, out: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(sources)
 }
 
-fn children_of(dir: &Path) -> Vec<PathBuf> {
-    fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .flatten()
-                .map(|entry| entry.path())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default()
+fn children_of(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let entries =
+        fs::read_dir(dir).map_err(|error| format!("无法读取 {}：{error}", dir.display()))?;
+    Ok(entries
+        .flatten()
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>())
 }
 
 /// 在 staging 里建一个以归档名命名的目录，把顶层项搬进去。目标与源在同一
 /// 个 staging 卷上，`rename` 就够；万一跨卷再退回复制。
 fn wrap(staging: &Path, stem: &str, sources: &[PathBuf]) -> Result<PathBuf, String> {
     let wrapper = staging.join("wrap").join(backend::file_component(stem));
-    fs::create_dir_all(&wrapper)
-        .map_err(|error| format!("无法创建导出目录：{error}"))?;
+    fs::create_dir_all(&wrapper).map_err(|error| format!("无法创建导出目录：{error}"))?;
     for source in sources {
         let name = source
             .file_name()
             .map(|name| name.to_os_string())
             .unwrap_or_default();
-        let target = backend::unique_path(&wrapper.join(name));
+        let target = backend::unique_path(&wrapper.join(name))?;
         if fs::rename(source, &target).is_err() {
-            copy(source, &target)?;
+            copy(source, &target, 0)?;
         }
     }
     Ok(wrapper)
 }
 
-fn copy(source: &Path, target: &Path) -> Result<(), String> {
+fn copy(source: &Path, target: &Path, depth: usize) -> Result<(), String> {
+    if depth > 64 {
+        return Err(format!("目录嵌套超过 64 层：{}", source.display()));
+    }
     if source.is_dir() {
         fs::create_dir_all(target).map_err(|error| error.to_string())?;
         for entry in fs::read_dir(source)
             .map_err(|error| format!("无法读取 {}：{error}", source.display()))?
             .flatten()
         {
-            copy(&entry.path(), &target.join(entry.file_name()))?;
+            copy(&entry.path(), &target.join(entry.file_name()), depth + 1)?;
         }
         Ok(())
     } else {
@@ -242,9 +309,86 @@ fn copy(source: &Path, target: &Path) -> Result<(), String> {
     }
 }
 
-fn stamp() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis())
-        .unwrap_or(0)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan(archive: &Path, declared_bytes: u64, entry_count: usize) -> Plan {
+        Plan {
+            archive: archive.to_path_buf(),
+            password: String::new(),
+            paths: Vec::new(),
+            outputs: Vec::new(),
+            declared_bytes,
+            entry_count,
+            root: String::new(),
+            target_label: String::new(),
+            policy: 0,
+            stem: "a".into(),
+        }
+    }
+
+    fn temp(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("lambda-extract-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_gate_refuses_too_many_entries() {
+        let dir = temp("count");
+        let archive = dir.join("a.7z");
+        fs::write(&archive, b"x").unwrap();
+        let plan = plan(&archive, 0, MAX_ENTRY_COUNT + 1);
+        assert!(matches!(gate(&plan, &dir), Err(Failure::Message(_))));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_gate_refuses_an_absurd_declared_ratio() {
+        let dir = temp("bomb");
+        let archive = dir.join("a.7z");
+        fs::write(&archive, vec![0u8; 1024]).unwrap();
+        let plan = plan(&archive, 1024 * 1024 * 1024, 1);
+        assert!(matches!(gate(&plan, &dir), Err(Failure::Message(_))));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_gate_accepts_a_normal_archive() {
+        let dir = temp("ok");
+        let archive = dir.join("a.7z");
+        fs::write(&archive, vec![0u8; 1024]).unwrap();
+        let plan = plan(&archive, 4096, 2);
+        assert!(gate(&plan, &dir).is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sources_refuse_missing_and_escaping_paths() {
+        let dir = temp("sources");
+        let out = dir.join("out");
+        fs::create_dir_all(&out).unwrap();
+        fs::write(dir.join("secret"), b"x").unwrap();
+        let mut plan = plan(&dir.join("a.7z"), 0, 0);
+
+        plan.outputs = vec![Output {
+            path: "missing.txt".into(),
+        }];
+        assert!(sources(&plan, &out).is_err());
+
+        plan.outputs = vec![Output {
+            path: "../secret".into(),
+        }];
+        assert!(sources(&plan, &out).is_err());
+
+        fs::write(out.join("ok.txt"), b"x").unwrap();
+        plan.outputs = vec![Output {
+            path: "ok.txt".into(),
+        }];
+        assert!(sources(&plan, &out).is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

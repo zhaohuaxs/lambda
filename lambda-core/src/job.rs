@@ -169,6 +169,9 @@ mod tests {
         let shared: Shared = Arc::new(Mutex::new(Job::new("压缩 3 项", 3)));
         Job::step(&shared, "读取", 2, "b.txt");
         let job = shared.lock().unwrap();
-        assert_eq!((job.phase.as_str(), job.done, job.label.as_str()), ("读取", 2, "b.txt"));
+        assert_eq!(
+            (job.phase.as_str(), job.done, job.label.as_str()),
+            ("读取", 2, "b.txt")
+        );
     }
 }

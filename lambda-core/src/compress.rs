@@ -14,7 +14,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use bern::media::MediaSource;
 use bern::wake::Waker;
@@ -41,6 +41,13 @@ pub struct Plan {
     pub name: String,
 }
 
+impl Drop for Plan {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.password.zeroize();
+    }
+}
+
 /// 工作线程里要压的一项（引擎侧的项目，比协议里的 `Entry` 多一个 URL）。
 pub struct Input {
     pub name: String,
@@ -60,7 +67,10 @@ pub fn start(job: Shared, waker: Waker, inputs: Vec<Input>, plan: Plan) {
 }
 
 fn run(job: &Shared, waker: &Waker, inputs: Vec<Input>, plan: Plan) -> Outcome {
-    let staging = backend::scratch().join(format!("job-{}", stamp()));
+    let staging = match backend::fresh_dir("job") {
+        Ok(staging) => staging,
+        Err(message) => return Outcome::Failed(message),
+    };
     let total = inputs.len() as i64;
     let outcome = match collect(job, waker, &inputs, &staging) {
         Ok(locals) => compress_and_export(job, waker, &locals, &staging, total, &plan),
@@ -152,7 +162,11 @@ fn compress_and_export(
     total: i64,
     plan: &Plan,
 ) -> Outcome {
-    let archive = staging.join(format!("{}.{}", plan.name, extension_of(plan.kind)));
+    let archive = staging.join(format!(
+        "{}.{}",
+        backend::file_component(&plan.name),
+        extension_of(plan.kind)
+    ));
     let password = if plan.password.is_empty() {
         None
     } else {
@@ -221,14 +235,6 @@ fn display(target: &str) -> String {
         return name;
     }
     uri.rsplit(['/', '\\']).next().unwrap_or(uri).to_string()
-}
-
-/// 工作目录用的唯一后缀：毫秒时间戳，任务串行，够用。
-fn stamp() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

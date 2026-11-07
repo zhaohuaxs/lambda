@@ -467,11 +467,7 @@ pub mod lambda {
 
         /// 给一个待解锁的归档再试一次密码。
         #[errors("archive")]
-        fn unlock_archive(
-            &mut self,
-            password: String,
-            secret: String,
-        ) -> Result<(), CommandError>;
+        fn unlock_archive(&mut self, password: String, secret: String) -> Result<(), CommandError>;
 
         /// 不打开这个加密归档了，清掉临时副本。
         #[idempotent]
@@ -533,11 +529,7 @@ pub mod lambda {
         // —— 密码簿 & 最近记录 ——
         /// 保存一条密码：标签落 JSON，密文进系统凭据库。
         #[errors("password")]
-        fn save_password(
-            &mut self,
-            label: String,
-            password: String,
-        ) -> Result<(), CommandError>;
+        fn save_password(&mut self, label: String, password: String) -> Result<(), CommandError>;
 
         /// 忘掉一条保存的密码。
         #[errors("password")]

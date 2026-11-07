@@ -11,10 +11,114 @@
 
 use bern::media::MediaSource;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 pub type Result<T> = std::result::Result<T, String>;
+
+/// Point the engine at a private log directory. Logs must never live next to
+/// the user's archive: a read-only folder used to make listing fail silently,
+/// and a writable one made `<name>.lambda7z.log` a truncate target.
+pub fn prepare_engine() {
+    #[cfg(any(windows, target_os = "android"))]
+    sevenzip_src::set_log_dir(scratch().join("logs"));
+}
+
+/// A writable directory the app owns on every platform.
+pub fn scratch() -> PathBuf {
+    bern::storage::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("lambda")
+}
+
+fn ensure(dir: &Path) -> Result<()> {
+    fs::create_dir_all(dir).map_err(|error| format!("无法创建工作目录 {}：{error}", dir.display()))
+}
+
+/// A fresh private directory, created atomically. The old `.as_millis()`
+/// names collided when two entries arrived in the same millisecond and were
+/// predictable enough to be pre-created.
+pub fn fresh_dir(prefix: &str) -> Result<PathBuf> {
+    let base = scratch();
+    ensure(&base)?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    for index in 0..1_000u32 {
+        let path = base.join(format!("{prefix}-{}-{stamp}-{index}", std::process::id()));
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!("无法创建工作目录 {}：{error}", path.display()));
+            }
+        }
+    }
+    Err(format!("无法为「{prefix}」创建唯一的工作目录"))
+}
+
+/// Write a file atomically: temp file, flush to disk, rename over the target.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        ensure(parent)?;
+    }
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    {
+        let mut file = fs::File::create(&tmp)
+            .map_err(|error| format!("无法写入 {}：{error}", tmp.display()))?;
+        file.write_all(bytes)
+            .map_err(|error| format!("无法写入 {}：{error}", tmp.display()))?;
+        file.sync_all()
+            .map_err(|error| format!("无法刷盘 {}：{error}", tmp.display()))?;
+    }
+    if let Err(error) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("无法替换 {}：{error}", path.display()));
+    }
+    Ok(())
+}
+
+/// A safe single path component (SAF display names can contain separators).
+pub fn file_component(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches([' ', '.']);
+    let trimmed = if trimmed.is_empty() {
+        "archive"
+    } else {
+        trimmed
+    };
+    let mut name = if windows_reserved(trimmed) {
+        format!("_{trimmed}")
+    } else {
+        trimmed.to_string()
+    };
+    // Ext4/APFS/NTFS all cap a component at 255 bytes, not characters.
+    if name.len() > 200 {
+        let mut end = 200;
+        while !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        name.truncate(end);
+    }
+    name
+}
+
+fn windows_reserved(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).trim_end();
+    let upper = stem.to_ascii_uppercase();
+    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (upper.len() == 4
+            && (upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.as_bytes()[3].is_ascii_digit())
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Report {
@@ -31,35 +135,7 @@ pub struct ListedEntry {
     pub size: u64,
     pub folder: bool,
     pub encrypted: bool,
-}
-
-/// A writable directory the app owns on every platform.
-pub fn scratch() -> PathBuf {
-    bern::storage::cache_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("lambda")
-}
-
-fn ensure(dir: &Path) -> Result<()> {
-    fs::create_dir_all(dir).map_err(|error| format!("无法创建工作目录 {}：{error}", dir.display()))
-}
-
-/// A safe single path component (SAF display names can contain separators).
-pub fn file_component(name: &str) -> String {
-    let cleaned: String = name
-        .chars()
-        .map(|c| match c {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0' => '_',
-            c if c.is_control() => '_',
-            c => c,
-        })
-        .collect();
-    let trimmed = cleaned.trim_matches([' ', '.']);
-    if trimmed.is_empty() {
-        "archive".into()
-    } else {
-        trimmed.chars().take(120).collect()
-    }
+    pub link: bool,
 }
 
 /// Copy the document at `url` into `dir` under its own name, keeping any file
@@ -77,7 +153,7 @@ pub fn copy_file_to(url: &str, dir: &Path) -> Result<PathBuf> {
     let source = MediaSource::new(url);
     ensure(dir)?;
     let name = file_component(&source.file_name().unwrap_or_else(|| "file".into()));
-    let target = unique_path(&dir.join(name));
+    let target = unique_path(&dir.join(name))?;
     let mut reader = source.open().map_err(|error| error.message)?;
     let mut writer = fs::File::create(&target)
         .map_err(|error| format!("无法写入 {}：{error}", target.display()))?;
@@ -97,11 +173,7 @@ pub fn import_folder_to(url: &str, dir: &Path) -> Result<PathBuf> {
 
 /// 同上，`visit` 每处理一个条目问一次：它的参数是条目名，返回 `false`
 /// 表示取消。界面用这个名字显示「正在读取 xxx」，也让取消立刻生效。
-pub fn import_folder_with(
-    url: &str,
-    dir: &Path,
-    visit: &dyn Fn(&str) -> bool,
-) -> Result<PathBuf> {
+pub fn import_folder_with(url: &str, dir: &Path, visit: &dyn Fn(&str) -> bool) -> Result<PathBuf> {
     if url.is_empty() {
         return Err("请先选择文件夹".into());
     }
@@ -111,10 +183,8 @@ pub fn import_folder_with(
         return Ok(path);
     }
     ensure(dir)?;
-    let name = file_component(
-        &bern::files::name(url).unwrap_or_else(|| "folder".into()),
-    );
-    let target = unique_path(&dir.join(name));
+    let name = file_component(&bern::files::name(url).unwrap_or_else(|| "folder".into()));
+    let target = unique_path(&dir.join(name))?;
     let mut budget = MAX_ENTRIES;
     copy_tree(url, &target, 0, visit, &mut budget)?;
     Ok(target)
@@ -146,7 +216,7 @@ fn copy_tree(
         if !visit(&entry.name) {
             return Err("已取消".into());
         }
-        let child = target.join(file_component(&entry.name));
+        let child = unique_path(&target.join(file_component(&entry.name)))?;
         if entry.folder {
             copy_tree(&entry.url, &child, depth + 1, visit, budget)?;
         } else {
@@ -174,15 +244,18 @@ pub fn create_archive_with(
 ) -> Result<u64> {
     #[cfg(any(windows, target_os = "android"))]
     {
-        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let watcher = watch_cancel(cancel.clone(), done.clone());
+        prepare_engine();
         let outcome = sevenzip_src::create_with_progress(
-            archive, inputs, password, kind, Some(level), slot,
+            archive,
+            inputs,
+            password,
+            kind,
+            Some(level),
+            slot,
+            Some(&cancel),
         )
         .map(|report| report.bytes)
         .map_err(|error| error.0);
-        done.store(true, std::sync::atomic::Ordering::Relaxed);
-        let _ = watcher.join();
         if cancel.load(std::sync::atomic::Ordering::Relaxed) && outcome.is_err() {
             return Err("已取消".into());
         }
@@ -193,20 +266,6 @@ pub fn create_archive_with(
         let _ = (archive, inputs, password, kind, level, slot, cancel);
         Err("本平台没有 7-Zip 引擎".into())
     }
-}
-
-/// A fresh staging path for an extraction result.
-pub fn extract_staging(archive: &Path) -> Result<PathBuf> {
-    let stem = archive
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "lambda-output".into());
-    let path = scratch().join("extracted").join(file_component(&stem));
-    if path.exists() {
-        let _ = fs::remove_dir_all(&path);
-    }
-    ensure(&path)?;
-    Ok(path)
 }
 
 /// A fresh staging path for a new archive.
@@ -226,7 +285,7 @@ pub fn create_staging(name: &str, fallback: &Path) -> Result<PathBuf> {
     };
     let dir = scratch().join("created");
     ensure(&dir)?;
-    Ok(unique_path(&dir.join(file_component(&base))))
+    unique_path(&dir.join(file_component(&base)))
 }
 
 /// Publish a local result into the folder the user picked. Android exports
@@ -234,13 +293,13 @@ pub fn create_staging(name: &str, fallback: &Path) -> Result<PathBuf> {
 /// no destination was picked, the private path is returned as-is.
 pub fn publish(local: &Path, dest: &MediaSource) -> Result<String> {
     if dest.url.is_empty() {
-        return Ok(local.display().to_string());
+        return Err("没有导出目标：解压结果留在私有目录里".into());
     }
 
     #[cfg(target_os = "android")]
     {
         if let Some(path) = bern::files::file_path(&dest.url).filter(|p| p.is_dir()) {
-            let target = unique_path(&path.join(local.file_name().unwrap_or_default()));
+            let target = unique_path(&path.join(local.file_name().unwrap_or_default()))?;
             copy_recursive(local, &target)?;
             return Ok(target.display().to_string());
         }
@@ -252,9 +311,9 @@ pub fn publish(local: &Path, dest: &MediaSource) -> Result<String> {
     #[cfg(not(target_os = "android"))]
     {
         let Some(path) = bern::files::file_path(&dest.url).filter(|p| p.is_dir()) else {
-            return Ok(local.display().to_string());
+            return Err("导出目标不是一个文件夹".into());
         };
-        let target = unique_path(&path.join(local.file_name().unwrap_or_default()));
+        let target = unique_path(&path.join(local.file_name().unwrap_or_default()))?;
         if target == local {
             return Ok(local.display().to_string());
         }
@@ -263,9 +322,9 @@ pub fn publish(local: &Path, dest: &MediaSource) -> Result<String> {
     }
 }
 
-pub fn unique_path(path: &Path) -> PathBuf {
+pub fn unique_path(path: &Path) -> Result<PathBuf> {
     if !path.exists() {
-        return path.to_path_buf();
+        return Ok(path.to_path_buf());
     }
     let stem = path
         .file_stem()
@@ -278,10 +337,13 @@ pub fn unique_path(path: &Path) -> PathBuf {
             None => path.with_file_name(format!("{stem}-{index}")),
         };
         if !candidate.exists() {
-            return candidate;
+            return Ok(candidate);
         }
     }
-    path.to_path_buf()
+    Err(format!(
+        "同名文件太多，无法为 {} 找一个不冲突的名字",
+        path.display()
+    ))
 }
 
 fn copy_recursive(source: &Path, target: &Path) -> Result<()> {
@@ -327,6 +389,7 @@ pub fn probe_engine() -> Result<String> {
 pub fn extract_archive(archive: &Path, password: Option<&str>, out: &Path) -> Result<Report> {
     #[cfg(any(windows, target_os = "android"))]
     {
+        prepare_engine();
         let report = sevenzip_src::extract(archive, password, out).map_err(|error| error.0)?;
         Ok(Report {
             files: report.files,
@@ -341,9 +404,14 @@ pub fn extract_archive(archive: &Path, password: Option<&str>, out: &Path) -> Re
     }
 }
 
-pub fn create_archive(archive: &Path, inputs: &[PathBuf], password: Option<&str>) -> Result<Report> {
+pub fn create_archive(
+    archive: &Path,
+    inputs: &[PathBuf],
+    password: Option<&str>,
+) -> Result<Report> {
     #[cfg(any(windows, target_os = "android"))]
     {
+        prepare_engine();
         let report = sevenzip_src::create(archive, inputs, password).map_err(|error| error.0)?;
         Ok(Report {
             files: report.files,
@@ -362,6 +430,7 @@ pub fn create_archive(archive: &Path, inputs: &[PathBuf], password: Option<&str>
 pub fn list_entries(archive: &Path, password: Option<&str>) -> Result<Vec<ListedEntry>> {
     #[cfg(any(windows, target_os = "android"))]
     {
+        prepare_engine();
         sevenzip_src::list(archive, password)
             .map(|entries| {
                 entries
@@ -371,6 +440,7 @@ pub fn list_entries(archive: &Path, password: Option<&str>) -> Result<Vec<Listed
                         size: entry.size,
                         folder: entry.folder,
                         encrypted: entry.encrypted,
+                        link: entry.link,
                     })
                     .collect()
             })
@@ -384,17 +454,24 @@ pub fn list_entries(archive: &Path, password: Option<&str>) -> Result<Vec<Listed
 }
 
 /// Stream one archive entry's bytes through the engine's stdout.
-pub fn stream_entry<F>(archive: &Path, password: Option<&str>, entry: &str, sink: F) -> Result<()>
+pub fn stream_entry<F>(
+    archive: &Path,
+    password: Option<&str>,
+    entry: &str,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    sink: F,
+) -> Result<()>
 where
     F: FnMut(&[u8]) -> bool,
 {
     #[cfg(any(windows, target_os = "android"))]
     {
-        sevenzip_src::stream_entry(archive, password, entry, sink).map_err(|error| error.0)
+        prepare_engine();
+        sevenzip_src::stream_entry(archive, password, entry, cancel, sink).map_err(|error| error.0)
     }
     #[cfg(not(any(windows, target_os = "android")))]
     {
-        let _ = (archive, password, entry, sink);
+        let _ = (archive, password, entry, cancel, sink);
         Err("本平台没有 7-Zip 引擎".into())
     }
 }
@@ -410,14 +487,17 @@ pub fn extract_entries(
 ) -> Result<u64> {
     #[cfg(any(windows, target_os = "android"))]
     {
-        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let watcher = watch_cancel(cancel.clone(), done.clone());
-        let outcome =
-            sevenzip_src::extract_selected_with_progress(archive, password, out, paths, slot)
-                .map(|report| report.bytes)
-                .map_err(|error| error.0);
-        done.store(true, std::sync::atomic::Ordering::Relaxed);
-        let _ = watcher.join();
+        prepare_engine();
+        let outcome = sevenzip_src::extract_selected_with_progress(
+            archive,
+            password,
+            out,
+            paths,
+            slot,
+            Some(&cancel),
+        )
+        .map(|report| report.bytes)
+        .map_err(|error| error.0);
         if cancel.load(std::sync::atomic::Ordering::Relaxed) && outcome.is_err() {
             return Err("已取消".into());
         }
@@ -430,28 +510,58 @@ pub fn extract_entries(
     }
 }
 
-/// Raises the engine's break flag once the user cancels.
-#[cfg(any(windows, target_os = "android"))]
-fn watch_cancel(
-    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> std::thread::JoinHandle<()> {
-    use std::sync::atomic::Ordering;
-    std::thread::spawn(move || {
-        while !done.load(Ordering::Relaxed) {
-            if cancel.load(Ordering::Relaxed) {
-                sevenzip_src::request_break();
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-    })
+/// Free bytes available to the app for `path`'s volume, when the platform can
+/// tell us. Used as the last extraction gate before a bomb fills the disk.
+pub fn free_space(path: &Path) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut free = 0u64;
+        let ok = unsafe {
+            GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &mut free,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        (ok != 0).then_some(free)
+    }
+    #[cfg(target_os = "android")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        let ok = unsafe { libc::statvfs(path.as_ptr(), &mut stat) };
+        (ok == 0).then(|| stat.f_bavail as u64 * stat.f_frsize as u64)
+    }
+    #[cfg(not(any(windows, target_os = "android")))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+#[cfg(windows)]
+unsafe extern "system" {
+    fn GetDiskFreeSpaceExW(
+        directory_name: *const u16,
+        free_bytes_available_to_caller: *mut u64,
+        total_number_of_bytes: *mut u64,
+        total_number_of_free_bytes: *mut u64,
+    ) -> i32;
 }
 
 /// Create a zip at `archive` from local inputs.
 pub fn create_zip(archive: &Path, inputs: &[PathBuf], password: Option<&str>) -> Result<Report> {
     #[cfg(any(windows, target_os = "android"))]
     {
+        prepare_engine();
         let report =
             sevenzip_src::create_with(archive, inputs, password, "zip").map_err(|e| e.0)?;
         Ok(Report {
