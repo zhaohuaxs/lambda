@@ -31,7 +31,7 @@ $ lambda extract -p password123 archive.7z
 | `压缩 N 项` + 密码框 | 把选中的文件与文件夹压成一个归档，落到**目录根**（`export_path` 只能写树根）；密码留空就是不加密。任务在后台跑，期间其它按钮照常响应 |
 | 进度区 | 只有任务在跑时出现：「压缩 3 项 · 45%」+ 进度条 + 「压缩 a.txt」+ `取消`。Android 的引擎阶段取消要等 7-Zip 返回，文案会提前说清 |
 | 归档文本预览 | 归档表里 TXT / XML / JSON / log / CSV / md 等已知文本格式，大小列变成文档图标；点开弹出预览模态，显示编码与「第 N / M 页」，页脚上一页 / 下一页；大文件按 12,000 字符分页流式读取，不落临时文件 |
-| 归档图片预览 | PNG / JPEG / GIF / WebP / BMP 等已知图片格式，大小列变成图片图标；点开弹出图片预览，宿主在后台读取 `files::serve` 提供的流并按显示尺寸采样解码；状态行显示格式、像素与大小，超 64 MB 或 5000 万像素拒绝预览；模态按内容定高，同一层有多张图时页脚出现「上一张 / 第 N / M 张 / 下一张」，单张不显示翻页 |
+| 归档图片预览 | PNG / JPEG / GIF / WebP / BMP 等已知图片格式，大小列变成图片图标；点开弹出图片预览，宿主在后台读取 `files::serve` 提供的流并按显示尺寸采样解码；状态行显示格式、像素与大小，超 64 MB 或 2400 万像素拒绝预览；模态按内容定高，同一层有多张图时页脚出现「上一张 / 第 N / M 张 / 下一张」，单张不显示翻页 |
 | 边界补测 | 不再出现在界面：CLI/MCP 调 `boundary()` 运行，报告写到应用私有目录（`m5-report.txt`） |
 | 上次任务未完成 | 进程被系统回收后再启动，多一行「上次任务未完成：压缩 1 项（7z，停在「压缩」）· 刚刚」+ `重试` / `忽略` |
 | 底部 | 「已选 N 项 · 1.7 MB」+「共 N 项 · 名称 ↑」+ 状态行 + 引擎名 |
@@ -100,11 +100,11 @@ Android 侧的约束最硬：Bern 0.1.10 的后端把应用 crate 链成唯一�
 2. Android 上 `build.rs` 用 `cc` crate + Bern 已设置的 `CC_aarch64_linux_android` 交叉编译。**不能用 `.cpp(true)`**：cc-rs 会把 `.c` 也交给 clang++，7-Zip 的 `C/MtDec.h` 依赖 C 的 tag/typedef 命名空间，会报 `typedef redefinition`。改为 `cpp(false)`，靠扩展名让 clang 自动区分 C / C++。
 3. 🔴 **Android 必须把所有 `.o` 用 `ld.lld -r` 合并成单一可重定位对象再打包**。7-Zip 的 codec / archive handler 靠 `*Reg.cpp` 里的全局构造函数注册（`REGISTER_ARC_*` 宏 → `.init_array`）；普通 `.a` 会被链接器按「解析未定义符号」裁剪，结果 `.so` 里没有 `NArchive::N7z::CHandler`，运行时报「找不到处理归档的代码」。另外 Cargo 的 `OUT_DIR` 在改 `build.rs` 后不变，归档前要 `remove_file`，否则旧成员残留。
    Windows 没有 `ld -r`：`build.rs` 用 MSVC 编译同样 324 个单元（另加 5 个 Windows 系统单元），把全部 `.o` 写进 `lambda7z-msvc.rsp`；`build-sequential.cmd` 把它注入 Bern 生成的链接命令，CLI 则链 `lambda7z.lib` 并加 `/WHOLEARCHIVE:lambda7z`。注册对象同样不能被裁掉，而且 `bern build --target windows` 每次都会重写 `build.bat`，所以包装脚本必须跟在每次构建之后。
-4. `bridge/lambda7z.cpp` 导出 `lambda7z_run(...)` 与 `lambda7z_run_stream(...)`：用 `dup2`（Windows 上是 `_dup2`）把 stdout/stderr 临时重定向到日志文件或管道，**进程内调用 `MainAr.cpp` 的 `lambda7z_engine_main`**（`Z7_LAMBDA_INPROCESS` 下的稳定 C 入口；Windows 直接接收 argv，不再通过 `GetCommandLineW()` 重读命令行），返回退出码并把日志尾部交回 Rust；`std::mutex` 串行化调用。Windows 的 WinUI 进程没有控制台，桥接层会先把无效的 CRT 标准流 `_wfreopen(NUL)` 再重定向，否则 `fwrite(stdout)` 静默失败。取消走 `lambda7z_request_break()` 递增 `NConsoleClose::g_BreakCounter`，每次调用开始清零。
+4. `bridge/lambda7z.cpp` 导出 `lambda7z_run(...)` 与 `lambda7z_run_stream(...)`：用 `dup2`（Windows 上是 `_dup2`）把 stdout/stderr 临时重定向到日志文件或管道，**进程内调用 `MainAr.cpp` 的 `lambda7z_engine_main`**（`Z7_LAMBDA_INPROCESS` 下的稳定 C 入口；Windows 直接接收 argv，不再通过 `GetCommandLineW()` 重读命令行），返回退出码并把日志尾部交回 Rust；`std::mutex` 串行化调用。Windows 的 WinUI 进程没有控制台，桥接层会先把无效的 CRT 标准流 `_wfreopen(NUL)` 再重定向，否则 `fwrite(stdout)` 静默失败。取消由桥接层登记本次调用的回调、补丁后的 `TestBreakSignal()` 查询，7-Zip 在下一个进度回调点退出；不再使用全局 `g_BreakCounter`。
 5. Rust 侧构造官方 7zz 参数：`x -y -o<dir> -p<pw> <archive>` / `a -t7z -y -p<pw> -mhe=on <out.7z> <inputs>`。
 6. 🔴 **Android 的 C++ 运行时必须动态链 NDK 的 `libc++_shared.so` 并随包**。早期「静态链 `c++_static`」的写法在桌面编译能过、符号也能解析，但真机 `dlopen` 会崩。`build.rs` 从 `CC_<target>` 反推 NDK sysroot，把 `libc++_shared.so` 复制到**私有的 `OUT_DIR/ndk_shared`**（`-L` 只指这个目录），再复制到 `target/bern/android/project/app/src/main/jniLibs/arm64-v8a/`，最后 `println!("cargo:rustc-link-lib=dylib=c++_shared")`。Bern 每次构建都会重建 `jniLibs`，所以这一步每轮都要做。
 
-`content://` 的单文件由 `bern::files::open()` 复制进 `cache_dir()/lambda/input`，文档树由 `bern::platform::import_folder()` 递归导入；结果通过 `bern::platform::export_path()`（文件与目录都能递归导出）写回用户选中的文件夹。全部路径在应用私有目录里，不需要 `READ/WRITE_EXTERNAL_STORAGE` 权限。
+`content://` 的单文件由 `bern::files::open()` 复制进应用私有 cache；文档树由 `backend::import_folder_with` 自己用 `bern::files::list` 递归导入（`platform::import_folder` 会回溯到整棵授权树，不能用）；结果通过 `bern::platform::export_path()`（文件与目录都能递归导出）写回用户选中的文件夹。全部路径在应用私有目录里，不需要 `READ/WRITE_EXTERNAL_STORAGE` 权限。
 
 ## 归档预览（文本 + 图片）
 
@@ -115,7 +115,7 @@ Android 侧的约束最硬：Bern 0.1.10 的后端把应用 crate 链成唯一�
 - **页环**：12,000 字符/页，页尾优先在附近换行处切开；最多预读 2 页、保留最近 16 页。页环满时 worker 在 condvar 上停住，7-Zip 随之被管道背压停住；状态里只放当前页。
 - **密码**：复用打开归档时留在 `OpenArchive` 内存里的那一份，不弹第二个密码框；密码仍不进 State / 日志 / 任务记录。加密条目没有可用密码时直接报「先在解压里输入密码」。
 - **边界**：只认文本后缀，不解析 XML 实体、不执行内容、不提供编辑 / 搜索 / 高亮；NUL 与其他控制字符显示成空格。
-- **图片**：`picture.rs` 用 `bern::files::serve("lambda-picture", ...)` 给 `Image(source:)` 提供带一次性 token 的 URL。宿主在后台把流读完，再按控件尺寸采样解码；窗口关闭/切换预览时 token 被移除，流式 7z 调用随之中止。只接受 PNG / JPEG / GIF / WebP / BMP / APNG 等双端解码器都稳的格式；条目超过 64 MB 或像素超过 5000 万时只显示拒绝原因。状态行显示「PNG · 1024 × 1024 · 44.3 KB」这类信息。图片模态不设固定高度：`Adaptive` 放在模态外按窗口宽度选控件尺寸，Modal 只按内容量高，底部不再留空。同级图片在打开预览时按归档表当前顺序收集（不含文件夹与没有密码的加密图片），页脚提供「上一张 / 第 N / M 张 / 下一张」，首尾禁用；只有一张时不出现翻页行。不提供缩放、平移，也不做手势滑动。
+- **图片**：`picture.rs` 用 `bern::files::serve("lambda-picture", ...)` 给 `Image(source:)` 提供带随机 token 的 URL。宿主在后台把流读完，再按控件尺寸采样解码；窗口关闭/切换预览时 token 被移除，流式 7z 调用随之中止。只接受 PNG / JPEG / GIF / WebP / BMP / APNG 等双端解码器都稳的格式；条目超过 64 MB 或像素超过 2400 万时只显示拒绝原因。状态行显示「PNG · 1024 × 1024 · 44.3 KB」这类信息。图片模态不设固定高度：`Adaptive` 放在模态外按窗口宽度选控件尺寸，Modal 只按内容量高，底部不再留空。同级图片在打开预览时按归档表当前顺序收集（不含文件夹与没有密码的加密图片），页脚提供「上一张 / 第 N / M 张 / 下一张」，首尾禁用；只有一张时不出现翻页行。不提供缩放、平移，也不做手势滑动。
 
 ## 体积实测（2026-11-08，7-Zip 26.04 release）
 
@@ -135,13 +135,13 @@ Windows CLI 从上一版「交付合计」2,066,432 B，变成 5,210,624 B 的�
 ## 已知边界
 
 - **引擎现在是 7zz（全格式）**：7z（LZMA / LZMA2 / BCJ / BCJ2 / Delta / Copy + AES）、ZIP（含 `-mem=AES256` 创建）、RAR / RAR5（只读）、TAR、gz / bz2 / xz / zst、ISO、CAB。`LAMBDA_7Z_BUNDLE=7zr` 仍可编回精简版（164 单元），但只有 7z / LZMA / XZ / Split；体积会明显变小（26.04 下未单独实测）。
-- **压缩、解压、预览都在后台线程**：任务由 `wake::Waker` 驱动，进度与取消都不阻塞界面；`import_folder` / `export_path` 也在任务线程里跑。引擎调用仍由桥接层的 `std::mutex` 串行，第二个 7-Zip 操作要排队。Windows 取消会把 `g_BreakCounter` 置位，7-Zip 在下一个回调点退出；**Android 的引擎阶段取消要等 `7zz` 返回**（实测 384 MB 压缩从 17% 取消到落地 +61 s），进度区会提前说明。
+- **压缩、解压、预览都在后台线程**：任务由 `wake::Waker` 驱动，进度与取消都不阻塞界面；`backend::import_folder_with` / `export_path` 也在任务线程里跑。引擎调用仍由桥接层的 `std::mutex` 串行，第二个 7-Zip 操作要排队。取消通过本次调用的取消回调让 7-Zip 在下一个进度回调点退出（双端一致）；**单个固实块编码期间仍要等下一次回调**（384 MB 压缩从 17% 取消到落地曾实测 +61 s），进度区会提前说明。
 - **`import_folder` / `export_path` 有上限**：Kotlin 实现限制 10,000 文件 / 10,000 目录 / 32 层导入、导出 128 层；超大文件夹要分块。
-- **密码明文**：UI `TextInput` 未遮蔽，引擎通过 argv `-p` 传递（同进程内无命令行泄露，但内存里是明文）。任务记录 `jobs/current.json` 只写 `locked: true`，**不存密码**；重试加密任务要重新输。
+- **密码明文**：UI 五处密码输入都是 `kind: secure`（界面已遮蔽），引擎通过 argv `-p` 传递（同进程内无命令行泄露，但内存里是明文，桥接层返回前会清零自己的副本）。任务记录 `jobs/current.json` 只写 `locked: true`，**不存密码**；重试加密任务要重新输。
 - **旧编码 ZIP 名**：ZIP 没打 UTF-8 标志时，7-Zip 的 Linux 版把文件名的原始字节原样写进 `-slt` 日志；列表按字节解析，并把整包所有旧编码名拼起来检测一次（chardetng 的 CJK 结果 + 限定候选集的 chardet-rs），支持 GBK/GB18030、Big5、Shift_JIS、EUC-KR、EUC-JP、Windows-1252 和 CP437。**Windows 引擎在输出前就会按 OEM 代码页转换名字**，所以引擎层会先读 ZIP 中央目录的原始名、跑同一套检测，再用 `-mcp=<代码页>` 让列表/解压/预览按同一编码解码。剩余风险：整包只有很短的名字时仍可能判错（例如单名 Big5 会判成 EUC-JP）；混合编码包按 UTF-8 合法性逐名处理，未打标志但恰好是合法 UTF-8 的旧编码名会被当成 UTF-8；CP437 与 CP1252 的单字节文本可能混淆。
 - **文本预览只保证 UTF-8 / ASCII 条目名（Android）**：旧编码 ZIP 名在列表里能正确显示，但 Android 的 7-Zip 仍按原始字节匹配条目，把解码后的名字交回去会匹配失败，预览报错；Windows 走 `-mcp`，显示名与条目路径一致。后续三条路线（7-Zip 改码页 / Rust 兜底读 ZIP 中央目录 / 保留原始字节匹配）都还没做。
 - **文本预览按后缀白名单**：不在名单里的无后缀文件与二进制不进入预览；页环只保留最近 16 页，更早的页不能回翻；XML 不解析实体；很短的样本仍可能判错编码。
-- **图片预览的边界**：只认 png / jpg / jpeg / jfif / gif / webp / bmp / apng；单条 64 MB、5000 万像素上限。Bern 的宿主会把整条流读进内存再按显示尺寸采样，因此内存由上限兜底，而不是流式分页；关闭预览会丢弃引擎 token 并中止 7z，但宿主按 URL 保留的解码缓存（64 MB LRU）不保证立即清空。多图只在打开预览时按当前层与表格顺序取同级图片，翻页用按钮、不做手势；切换排序或进出目录前翻页列表不会更新。不支持缩放、平移，也不对 EXIF 方向以外的元数据做解释。
+- **图片预览的边界**：只认 png / jpg / jpeg / jfif / gif / webp / bmp / apng；单条 64 MB、2400 万像素上限。Bern 的宿主会把整条流读进内存再按显示尺寸采样，因此内存由上限兜底，而不是流式分页；关闭预览会丢弃引擎 token、等待在途读结束再返回；宿主按 URL 保留的解码缓存（64 MB LRU）不保证立即清空。多图只在打开预览时按当前层与表格顺序取同级图片，翻页用按钮、不做手势；切换排序或进出目录前翻页列表不会更新。不支持缩放、平移，也不对 EXIF 方向以外的元数据做解释。
 - **压缩忽略 `import_folder` 的深度限制**：`backend::import_folder_with` 自己 `files::list` 递归，预算 200,000 条 / 32 层（`platform::import_folder` 会把整棵授权树搬进来，不能用）。
 - **7zz 的 console front-end（`MainAr.cpp`）会临时安装 Ctrl-C / SIGINT/SIGTERM 处理器**（`CCtrlHandlerSetter` 析构时恢复），并在 stdout/stderr 上输出；桥接层用 `dup2` / `_dup2` 重定向到私有日志、mutex 串行化，正常路径不调用 `exit()`（只在收到多次中断信号时）。真机多次解压/压缩后进程仍存活，未破坏宿主。
 

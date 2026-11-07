@@ -21,4 +21,17 @@
 
 ## Rust 依赖
 
-`Cargo.lock` 中的 crate 按各自许可分发。直接依赖里 `bern` 及其同族 crate 属 MIT（[AimesSoft/Bern](https://github.com/AimesSoft/Bern)），`chardet-rs` 与 `encoding_rs` 为 MIT / Apache-2.0。
+`Cargo.lock` 中的 crate 按各自许可分发。直接依赖及其许可：
+
+| crate | 许可 |
+|---|---|
+| `bern` 及其同族 crate（[AimesSoft/Bern](https://github.com/AimesSoft/Bern)） | MIT |
+| `chardet-rs` | MIT |
+| `chardetng` | Apache-2.0 OR MIT |
+| `encoding_rs` | Apache-2.0 OR MIT |
+| `serde_json` | Apache-2.0 OR MIT |
+| `zeroize` | Apache-2.0 OR MIT |
+| `libc`（Android） | Apache-2.0 OR MIT |
+| `cc`（构建依赖） | MIT OR Apache-2.0 |
+
+其余传递依赖同样按 `Cargo.lock` 中各自的 `license` 字段分发；发行时须随包保留本文件与各许可原文。`tools/make_sbom.py` 可生成完整的包-许可清单。Windows 安装包与 Android APK 的 `assets/notices/` 由 `sevenzip-src/build.rs` 在构建时复制。
