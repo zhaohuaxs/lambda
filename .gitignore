@@ -22,3 +22,21 @@ rustc-ice-*.txt
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# build
+.DS_Store
+*.log
+device-out/
+dev_docs/
+
+# 根目录的图标生成源；不要写成 icon/，否则会连带忽略 assets/icon
+/icon/
+
+# 签名材料与本地环境
+*.jks
+*.keystore
+*.p12
+*.pfx
+keystore.properties
+.env
+.env.*
