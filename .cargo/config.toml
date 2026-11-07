@@ -1,0 +1,6 @@
+[target.x86_64-pc-windows-msvc]
+# `+crt-static` matches Bern's glue config and the C++ side's /MT. Keep it in
+# the workspace config too: if cargo is invoked from the workspace root,
+# the glue's own .cargo/config.toml is not the nearest one and would otherwise
+# be lost. `control-flow-guard` hardens the Rust half of the in-process parser.
+rustflags = ["-C", "target-feature=+crt-static", "-C", "control-flow-guard"]

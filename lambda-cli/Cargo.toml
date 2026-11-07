@@ -13,3 +13,4 @@ path = "src/main.rs"
 
 [dependencies]
 sevenzip-src = { path = "../sevenzip-src" }
+zeroize = "1"

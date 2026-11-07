@@ -35,11 +35,9 @@ type = "lambda_core::LambdaEngine"
 # menu 是安装包在资源管理器右键菜单里的一项（Windows 11 在“显示更多选项”下）。
 [[app.opens]]
 files = [
-  ".7z", ".zip", ".zipx", ".rar",
-  ".tar", ".gz", ".tgz", ".bz2", ".tbz", ".tbz2", ".xz", ".txz", ".lzma", ".lz4", ".zst", ".tzst",
-  ".cab", ".iso", ".arj", ".lzh", ".lha", ".rpm", ".deb", ".cpio",
-  ".wim", ".msi", ".chm", ".dmg", ".xar", ".z", ".taz", ".tpz",
-  ".vhd", ".vhdx", ".squashfs"
+  ".7z", ".zip", ".rar",
+  ".tar", ".gz", ".tgz", ".bz2", ".tbz2", ".xz", ".zst",
+  ".cab", ".iso"
 ]
 menu = { "zh-Hans" = "用 Lambda 打开", "en" = "Open with Lambda" }
 
