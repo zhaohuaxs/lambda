@@ -1,0 +1,15 @@
+[package]
+name = "lambda-cli"
+description = "lambda extract -p <password> <archive>: the free-form CLI front-end for Lambda"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "lambda"
+path = "src/main.rs"
+
+[dependencies]
+sevenzip-src = { path = "../sevenzip-src" }

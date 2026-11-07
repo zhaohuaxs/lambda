@@ -1,0 +1,20 @@
+[package]
+name = "lambda-core"
+description = "Lambda: the engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+bern.workspace = true
+lambda-protocol.workspace = true
+# 位置表 locations.json 的读写（M0 spike 与后续 Locations 共用）。
+serde_json = "1"
+# 预览文本的编码检测与增量解码。
+chardet_rs = { package = "chardet-rs", version = "=0.1.0" }
+encoding_rs = "0.8"
+
+[target.'cfg(any(windows, target_os = "android"))'.dependencies]
+sevenzip-src = { path = "../sevenzip-src" }
