@@ -103,16 +103,11 @@ fn legacy_names(path: &Path) -> Option<Vec<Vec<u8>>> {
 
 fn find_last(haystack: &[u8], signature: u32) -> Option<usize> {
     let needle = signature.to_le_bytes();
-    haystack
-        .windows(4)
-        .rposition(|window| window == needle)
+    haystack.windows(4).rposition(|window| window == needle)
 }
 
 fn read_u16(buffer: &[u8], at: usize) -> Option<u16> {
-    Some(u16::from_le_bytes([
-        *buffer.get(at)?,
-        *buffer.get(at + 1)?,
-    ]))
+    Some(u16::from_le_bytes([*buffer.get(at)?, *buffer.get(at + 1)?]))
 }
 
 fn read_u32(buffer: &[u8], at: usize) -> Option<u32> {
@@ -183,7 +178,9 @@ mod tests {
         // 中文.txt / 测试文件.txt in GBK, no UTF-8 flag.
         let names: [&[u8]; 2] = [
             &[0xD6, 0xD0, 0xCE, 0xC4, 0x2E, 0x74, 0x78, 0x74],
-            &[0xB2, 0xE2, 0xCA, 0xD4, 0xCE, 0xC4, 0xBC, 0xFE, 0x2E, 0x74, 0x78, 0x74],
+            &[
+                0xB2, 0xE2, 0xCA, 0xD4, 0xCE, 0xC4, 0xBC, 0xFE, 0x2E, 0x74, 0x78, 0x74,
+            ],
         ];
         let archive = zip_with_names(&names);
         assert_eq!(switch_for("gbk.zip", &archive).as_deref(), Some("-mcp=936"));
@@ -198,13 +195,14 @@ mod tests {
                 0xB4, 0xFA, 0xB8, 0xD5, 0xC0, 0xC9, 0xAE, 0xD7, 0x2E, 0x74, 0x78, 0x74,
             ],
             &[0xB3, 0xF8, 0xAA, 0xED, 0x2E, 0x78, 0x6C, 0x73, 0x78],
-            &[
-                0xB9, 0xCF, 0xA4, 0xF9, 0xB8, 0xEA, 0xAE, 0xC6, 0xA7, 0xA8,
-            ],
+            &[0xB9, 0xCF, 0xA4, 0xF9, 0xB8, 0xEA, 0xAE, 0xC6, 0xA7, 0xA8],
             &[0xB5, 0x6F, 0xB2, 0xBC],
         ];
         let archive = zip_with_names(&names);
-        assert_eq!(switch_for("big5.zip", &archive).as_deref(), Some("-mcp=950"));
+        assert_eq!(
+            switch_for("big5.zip", &archive).as_deref(),
+            Some("-mcp=950")
+        );
     }
 
     #[test]

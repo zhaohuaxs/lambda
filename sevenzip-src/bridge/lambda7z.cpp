@@ -32,6 +32,7 @@
 #else
 #include <csignal>
 #include <fcntl.h>
+#include <signal.h>
 #include <unistd.h>
 #endif
 
@@ -50,7 +51,28 @@ typedef int (*lambda7z_sink_fn)(void *user, const unsigned char *data, size_t si
 static std::mutex g_lambda7z_mutex;
 static std::once_flag g_lambda7z_unbuffered;
 #ifndef _WIN32
-static std::once_flag g_lambda7z_sigpipe;
+// 7-Zip's `-so` writes into a pipe; a closed read end must not terminate the
+// whole application. The handler is restored when the call returns instead of
+// leaking the process-wide change into the host.
+struct Lambda7zSigpipeScope
+{
+    struct sigaction old;
+    bool active;
+    Lambda7zSigpipeScope()
+    {
+        active = sigaction(SIGPIPE, nullptr, &old) == 0;
+        if (active) {
+            struct sigaction ignore {};
+            ignore.sa_handler = SIG_IGN;
+            sigemptyset(&ignore.sa_mask);
+            sigaction(SIGPIPE, &ignore, nullptr);
+        }
+    }
+    ~Lambda7zSigpipeScope()
+    {
+        if (active) sigaction(SIGPIPE, &old, nullptr);
+    }
+};
 #endif
 
 #ifdef _WIN32
@@ -77,7 +99,11 @@ static std::wstring lambda7z_wide_path(const char *utf8)
 static int lambda7z_open_log(const char *path)
 {
     const std::wstring wide = lambda7z_wide_path(path);
-    return _wopen(wide.c_str(), _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY, _S_IREAD | _S_IWRITE);
+    // O_EXCL: the name is unique per call, so an existing file (or a planted
+    // link) must never be truncated. O_NOINHERIT keeps the fd out of children.
+    return _wopen(wide.c_str(),
+                  _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY | _O_NOINHERIT,
+                  _S_IREAD | _S_IWRITE);
 }
 
 static FILE *lambda7z_fopen_read(const char *path)
@@ -126,7 +152,7 @@ static int lambda7z_stderr_fd()
 
 static int lambda7z_open_log(const char *path)
 {
-    return open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    return open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
 }
 
 static FILE *lambda7z_fopen_read(const char *path)
@@ -168,11 +194,19 @@ static void read_log_tail(const char *log_path, char *message, size_t message_ca
     if (!message || message_cap <= 1) return;
     FILE *log = lambda7z_fopen_read(log_path);
     if (!log) return;
-    if (std::fseek(log, 0, SEEK_END) == 0) {
-        const long size = std::ftell(log);
-        const long wanted = static_cast<long>(message_cap - 1);
-        const long take = size > wanted ? wanted : size;
-        if (take > 0 && std::fseek(log, size - take, SEEK_SET) == 0) {
+#ifdef _WIN32
+    if (_fseeki64(log, 0, SEEK_END) == 0) {
+        const __int64 size = _ftelli64(log);
+        const __int64 wanted = static_cast<__int64>(message_cap - 1);
+        const __int64 take = size > wanted ? wanted : size;
+        if (take > 0 && _fseeki64(log, size - take, SEEK_SET) == 0) {
+#else
+    if (fseeko(log, 0, SEEK_END) == 0) {
+        const off_t size = ftello(log);
+        const off_t wanted = static_cast<off_t>(message_cap - 1);
+        const off_t take = size > wanted ? wanted : size;
+        if (take > 0 && fseeko(log, size - take, SEEK_SET) == 0) {
+#endif
             const size_t read = std::fread(message, 1, static_cast<size_t>(take), log);
             message[read] = 0;
             // Trim a lone leading LF left by the tail cut.
@@ -182,23 +216,71 @@ static void read_log_tail(const char *log_path, char *message, size_t message_ca
     std::fclose(log);
 }
 
-// Called by the Rust watcher thread when the user cancels. The bridge clears
-// the counter at the start of every call, so a stale break cannot kill the
-// next operation.
-extern "C" void lambda7z_request_break(void)
+typedef int (*lambda7z_cancel_fn)(void *user);
+
+static lambda7z_cancel_fn g_cancel_fn = nullptr;
+static void *g_cancel_user = nullptr;
+
+// Called by the patched TestBreakSignal() on the engine thread. The callback
+// belongs to the call that is running under the mutex; a cancel therefore
+// cannot be lost in a startup window or kill an unrelated operation.
+extern "C" int lambda7z_cancel_requested(void)
 {
-    ++NConsoleClose::g_BreakCounter;
+    const lambda7z_cancel_fn fn = g_cancel_fn;
+    return fn ? fn(g_cancel_user) : 0;
+}
+
+// Registers the current call's cancel callback and clears it on every exit
+// path (including the log-open failure below).
+struct Lambda7zCancelScope
+{
+    Lambda7zCancelScope(lambda7z_cancel_fn fn, void *user)
+    {
+        g_cancel_fn = fn;
+        g_cancel_user = user;
+    }
+    ~Lambda7zCancelScope()
+    {
+        g_cancel_fn = nullptr;
+        g_cancel_user = nullptr;
+    }
+};
+
+static void lambda7z_secure_zero(void *data, size_t size)
+{
+    #ifdef _WIN32
+    SecureZeroMemory(data, size);
+    #else
+    // bionic in NDK 28 does not declare explicit_bzero for every API level;
+    // volatile writes are not optimized away and are portable.
+    volatile unsigned char *bytes = static_cast<volatile unsigned char *>(data);
+    while (size > 0) {
+        *bytes++ = 0;
+        --size;
+    }
+    #endif
+}
+
+static void lambda7z_wipe_strings(std::vector<std::string> &items)
+{
+    for (auto &item : items) {
+        if (item.empty()) continue;
+        lambda7z_secure_zero(item.data(), item.size());
+    }
 }
 
 extern "C" int lambda7z_run(
     int argc,
     const char *const *argv,
     const char *log_path,
+    lambda7z_cancel_fn cancel,
+    void *cancel_user,
     char *message,
     size_t message_cap)
 {
     std::lock_guard<std::mutex> guard(g_lambda7z_mutex);
     NConsoleClose::g_BreakCounter = 0;
+    Lambda7zCancelScope cancel_scope(cancel, cancel_user);
     if (message && message_cap > 0) message[0] = 0;
     if (!argv || !log_path || argc <= 0) return 7;
 
@@ -218,9 +300,18 @@ extern "C" int lambda7z_run(
     const int saved_out = lambda7z_dup(out_fd);
     const int saved_err = lambda7z_dup(err_fd);
     const int log_fd = lambda7z_open_log(log_path);
+    if (log_fd < 0) {
+        // Without a log Rust cannot read the listing back; fail loudly instead
+        // of running with the output going to NUL and reporting an empty
+        // archive (a read-only archive directory used to do exactly that).
+        if (saved_out >= 0) lambda7z_close(saved_out);
+        if (saved_err >= 0) lambda7z_close(saved_err);
+        lambda7z_wipe_strings(owned);
+        return 9;
+    }
     // On some Android processes fd 1/2 are closed or /dev/null; never
     // redirect unless both can be restored afterwards.
-    const bool redirect = log_fd >= 0 && saved_out >= 0 && saved_err >= 0;
+    const bool redirect = saved_out >= 0 && saved_err >= 0;
 
     std::fflush(nullptr);
     if (redirect) {
@@ -250,6 +341,7 @@ extern "C" int lambda7z_run(
 
     // Keep the tail of the log: 7z prints the reason for a failure there.
     read_log_tail(log_path, message, message_cap);
+    lambda7z_wipe_strings(owned);
     return code;
 }
 
@@ -260,6 +352,8 @@ extern "C" int lambda7z_run_stream(
     int argc,
     const char *const *argv,
     const char *log_path,
+    lambda7z_cancel_fn cancel,
+    void *cancel_user,
     lambda7z_sink_fn sink,
     void *user,
     char *message,
@@ -267,6 +361,7 @@ extern "C" int lambda7z_run_stream(
 {
     std::lock_guard<std::mutex> guard(g_lambda7z_mutex);
     NConsoleClose::g_BreakCounter = 0;
+    Lambda7zCancelScope cancel_scope(cancel, cancel_user);
     if (message && message_cap > 0) message[0] = 0;
     if (!argv || !log_path || argc <= 0 || !sink) return 7;
 
@@ -280,9 +375,7 @@ extern "C" int lambda7z_run_stream(
 
     // A closed pipe write end must not terminate the whole application.
     #ifndef _WIN32
-    std::call_once(g_lambda7z_sigpipe, [] {
-        std::signal(SIGPIPE, SIG_IGN);
-    });
+    Lambda7zSigpipeScope sigpipe_scope;
     #else
     lambda7z_repair_std_streams();
     #endif
@@ -292,9 +385,15 @@ extern "C" int lambda7z_run_stream(
     const int saved_out = lambda7z_dup(out_fd);
     const int saved_err = lambda7z_dup(err_fd);
     const int log_fd = lambda7z_open_log(log_path);
+    if (log_fd < 0) {
+        if (saved_out >= 0) lambda7z_close(saved_out);
+        if (saved_err >= 0) lambda7z_close(saved_err);
+        lambda7z_wipe_strings(owned);
+        return 9;
+    }
     int stream_fds[2] = {-1, -1};
     const bool can_stream =
-        saved_out >= 0 && saved_err >= 0 && log_fd >= 0 && lambda7z_pipe(stream_fds) == 0;
+        saved_out >= 0 && saved_err >= 0 && lambda7z_pipe(stream_fds) == 0;
 
     if (!can_stream) {
         if (stream_fds[0] >= 0) lambda7z_close(stream_fds[0]);
@@ -305,6 +404,7 @@ extern "C" int lambda7z_run_stream(
         if (message && message_cap > 1) {
             std::snprintf(message, message_cap, "无法建立预览管道");
         }
+        lambda7z_wipe_strings(owned);
         return 8;
     }
 
@@ -346,5 +446,6 @@ extern "C" int lambda7z_run_stream(
 
     // Keep the tail of the log: 7z prints the reason for a failure there.
     read_log_tail(log_path, message, message_cap);
+    lambda7z_wipe_strings(owned);
     return code;
 }

@@ -12,13 +12,54 @@ use std::fs;
 #[cfg(any(target_os = "android", windows))]
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod encoding;
 #[cfg(windows)]
 mod zip_names;
+
+/// Entries above this are refused before the archive browser allocates for
+/// them. The cap is high enough for a normal photo/dataset archive and low
+/// enough that a crafted header cannot exhaust a phone.
+pub const MAX_LIST_ENTRIES: usize = 200_000;
+
+/// The listing log may not grow past this. A crafted archive with millions of
+/// tiny entries produces a log far larger than the entries themselves.
+const MAX_LIST_LOG_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Engine logs live in a private directory, never next to the user's archive.
+/// `lambda-core` points this at its own cache before the first engine call;
+/// the CLI and host tests fall back to the system temp directory.
+static LOG_DIR: OnceLock<PathBuf> = OnceLock::new();
+static LOG_SEQ: AtomicU64 = AtomicU64::new(0);
+
+pub fn set_log_dir(dir: PathBuf) {
+    let _ = LOG_DIR.set(dir);
+}
+
+fn log_path(tag: &str) -> PathBuf {
+    let dir = LOG_DIR
+        .get()
+        .cloned()
+        .unwrap_or_else(|| std::env::temp_dir().join("lambda-logs"));
+    let _ = fs::create_dir_all(&dir);
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let seq = LOG_SEQ.fetch_add(1, Ordering::Relaxed);
+    dir.join(format!("{}-{stamp}-{seq}-{tag}.log", std::process::id()))
+}
+
+fn remove_log(path: &Path) {
+    if let Ok(meta) = fs::symlink_metadata(path)
+        && meta.file_type().is_file()
+    {
+        let _ = fs::remove_file(path);
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error(pub String);
@@ -58,17 +99,15 @@ pub struct Entry {
     pub size: u64,
     pub folder: bool,
     pub encrypted: bool,
+    /// Symbolic or hard link. Extraction is refused for these: creating a
+    /// link inside staging lets a later entry write through it.
+    pub link: bool,
 }
 
 /// Build the argv for `7zz l -slt`. `-sccUTF-8` keeps non-ASCII names from
 /// being transliterated by the console charset conversion.
 pub fn list_args(archive: &Path, password: Option<&str>) -> Vec<String> {
-    let mut args: Vec<String> = vec![
-        exe().into(),
-        "l".into(),
-        "-slt".into(),
-        "-sccUTF-8".into(),
-    ];
+    let mut args: Vec<String> = vec![exe().into(), "l".into(), "-slt".into(), "-sccUTF-8".into()];
     if let Some(password) = password.filter(|p| !p.is_empty()) {
         args.push(format!("-p{password}"));
     }
@@ -81,7 +120,7 @@ pub fn list_args(archive: &Path, password: Option<&str>) -> Vec<String> {
 /// The output has one property block for the archive itself, a `----------`
 /// separator, then one block per item separated by blank lines. Only the
 /// blocks after the separator are items.
-pub fn parse_slt(text: &str) -> Vec<Entry> {
+pub fn parse_slt(text: &str) -> Result<Vec<Entry>, Error> {
     parse_slt_bytes(text.as_bytes())
 }
 
@@ -92,33 +131,46 @@ pub fn parse_slt(text: &str) -> Vec<Entry> {
 /// so parse at the byte level and decode names separately. The encoding is
 /// detected once from every legacy name in the archive: a single file name is
 /// too short for reliable detection.
-fn parse_slt_bytes(text: &[u8]) -> Vec<Entry> {
+fn parse_slt_bytes(text: &[u8]) -> Result<Vec<Entry>, Error> {
     let mut raw_entries: Vec<RawEntry> = Vec::new();
     let mut in_items = false;
     let mut path: Option<Vec<u8>> = None;
     let mut size = 0u64;
     let mut folder = false;
     let mut encrypted = false;
+    let mut link = false;
+    let mut too_many = false;
 
     let flush = |path: &mut Option<Vec<u8>>,
-                     size: &mut u64,
-                     folder: &mut bool,
-                     encrypted: &mut bool,
-                     entries: &mut Vec<RawEntry>| {
+                 size: &mut u64,
+                 folder: &mut bool,
+                 encrypted: &mut bool,
+                 link: &mut bool,
+                 entries: &mut Vec<RawEntry>,
+                 too_many: &mut bool| {
         if let Some(path) = path.take() {
-            entries.push(RawEntry {
-                path,
-                size: *size,
-                folder: *folder,
-                encrypted: *encrypted,
-            });
+            if entries.len() >= MAX_LIST_ENTRIES {
+                *too_many = true;
+            } else {
+                entries.push(RawEntry {
+                    path,
+                    size: *size,
+                    folder: *folder,
+                    encrypted: *encrypted,
+                    link: *link,
+                });
+            }
         }
         *size = 0;
         *folder = false;
         *encrypted = false;
+        *link = false;
     };
 
     for raw_line in text.split(|&byte| byte == b'\n') {
+        if too_many {
+            break;
+        }
         let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
         if line.starts_with(b"----------") {
             in_items = true;
@@ -128,7 +180,15 @@ fn parse_slt_bytes(text: &[u8]) -> Vec<Entry> {
             continue;
         }
         if line.iter().all(|byte| byte.is_ascii_whitespace()) {
-            flush(&mut path, &mut size, &mut folder, &mut encrypted, &mut raw_entries);
+            flush(
+                &mut path,
+                &mut size,
+                &mut folder,
+                &mut encrypted,
+                &mut link,
+                &mut raw_entries,
+                &mut too_many,
+            );
             continue;
         }
         let Some(eq) = line.windows(3).position(|window| window == b" = ") else {
@@ -141,25 +201,40 @@ fn parse_slt_bytes(text: &[u8]) -> Vec<Entry> {
             b"Size" => size = ascii(value).parse().unwrap_or(0),
             b"Folder" => folder = ascii(value) == "+",
             b"Encrypted" => encrypted = ascii(value) == "+",
+            b"Symbolic Link" | b"Hard Link" => link = !value.is_empty(),
             _ => {}
         }
     }
-    flush(&mut path, &mut size, &mut folder, &mut encrypted, &mut raw_entries);
+    flush(
+        &mut path,
+        &mut size,
+        &mut folder,
+        &mut encrypted,
+        &mut link,
+        &mut raw_entries,
+        &mut too_many,
+    );
+    if too_many {
+        return Err(Error(format!(
+            "归档条目超过 {MAX_LIST_ENTRIES} 项，暂不打开"
+        )));
+    }
 
     let paths: Vec<&[u8]> = raw_entries
         .iter()
         .map(|entry| entry.path.as_slice())
         .collect();
     let encoding = encoding::NameEncoding::detect(&paths);
-    raw_entries
+    Ok(raw_entries
         .into_iter()
         .map(|entry| Entry {
             path: encoding.decode(&entry.path),
             size: entry.size,
             folder: entry.folder,
             encrypted: entry.encrypted,
+            link: entry.link,
         })
-        .collect()
+        .collect())
 }
 
 struct RawEntry {
@@ -167,6 +242,7 @@ struct RawEntry {
     size: u64,
     folder: bool,
     encrypted: bool,
+    link: bool,
 }
 
 fn trim_ascii(bytes: &[u8]) -> &[u8] {
@@ -185,19 +261,36 @@ fn ascii(bytes: &[u8]) -> &str {
     std::str::from_utf8(bytes).unwrap_or("")
 }
 
-/// List `archive` through `7zz l -slt`. The textual output goes to a log file
-/// (see `bridge/lambda7z.cpp`), which is read back here before it is removed.
+/// List `archive` through `7zz l -slt`. The textual output goes to a private
+/// log file, which is read back here before it is removed.
 pub fn list(archive: &Path, password: Option<&str>) -> Result<Vec<Entry>, Error> {
     if !archive.is_file() {
         return Err(Error(format!("归档不存在：{}", archive.display())));
     }
-    let log = archive.with_extension("lambda7z.list.log");
-    // 失败也必须删日志：`?` 提前返回会把 `.lambda7z.list.log` 留在归档旁边。
-    let outcome = run(&with_codepage(archive, list_args(archive, password)), &log);
-    let bytes = fs::read(&log).unwrap_or_default();
-    let _ = fs::remove_file(&log);
+    let log = log_path("list");
+    let cancel = Arc::new(AtomicBool::new(false));
+    let guard = LogGuard::start(log.clone(), MAX_LIST_LOG_BYTES, cancel.clone());
+    let outcome = run(
+        &with_codepage(archive, list_args(archive, password)),
+        &log,
+        Some(&cancel),
+    );
+    drop(guard);
+    let read = fs::read(&log);
+    remove_log(&log);
+    if cancel.load(Ordering::Acquire) {
+        return Err(Error(format!(
+            "归档条目超过 {MAX_LIST_ENTRIES} 项，暂不打开"
+        )));
+    }
     outcome?;
-    Ok(parse_slt_bytes(&bytes))
+    let bytes = read.map_err(|error| Error(format!("无法读取引擎日志：{error}")))?;
+    if bytes.len() as u64 > MAX_LIST_LOG_BYTES {
+        return Err(Error(format!(
+            "归档条目超过 {MAX_LIST_ENTRIES} 项，暂不打开"
+        )));
+    }
+    parse_slt_bytes(&bytes)
 }
 
 /// Build `7zz x -so` for one entry. File data goes to stdout; console
@@ -219,16 +312,22 @@ pub fn preview_args(archive: &Path, password: Option<&str>, entry: &str) -> Vec<
         args.push(format!("-p{password}"));
     }
     args.push(archive.display().to_string());
+    // Everything after `--` is an entry name. Without it, an entry called
+    // `-p…`, `-o…`, `@list` or `*` is parsed as a switch or a list file.
+    args.push("--".into());
     args.push(entry.to_string());
     args
 }
 
 /// Stream one entry's data through `7zz x -so`. The sink returns `false` to
 /// stop early; the caller decides whether an early stop is a cancellation.
+/// `cancel` is checked by 7-Zip itself, so the engine stops at its next
+/// progress callback instead of waiting for a pipe write to fail.
 pub fn stream_entry<F>(
     archive: &Path,
     password: Option<&str>,
     entry: &str,
+    cancel: Option<&AtomicBool>,
     sink: F,
 ) -> Result<(), Error>
 where
@@ -237,13 +336,14 @@ where
     if !archive.is_file() {
         return Err(Error(format!("归档不存在：{}", archive.display())));
     }
-    let log = archive.with_extension("lambda7z.preview.log");
+    let log = log_path("preview");
     let outcome = run_stream(
         &with_codepage(archive, preview_args(archive, password, entry)),
         &log,
+        cancel,
         sink,
     );
-    let _ = fs::remove_file(&log);
+    remove_log(&log);
     outcome
 }
 
@@ -285,12 +385,18 @@ pub fn extract_args(archive: &Path, password: Option<&str>, out_dir: &Path) -> V
         // Progress goes to the same log the error message is read from; the
         // browser's extraction task needs a percentage for big archives.
         "-bsp1".into(),
+        // Names arrive after `--`; keep wildcard characters literal and never
+        // materialise archive links (26.04 would otherwise create them).
+        "-spd".into(),
+        "-snl-".into(),
+        "-snh-".into(),
         format!("-o{}", out_dir.display()),
     ];
     if let Some(password) = password.filter(|p| !p.is_empty()) {
         args.push(format!("-p{password}"));
     }
     args.push(archive.display().to_string());
+    args.push("--".into());
     args
 }
 
@@ -345,19 +451,18 @@ pub fn create_args(
 }
 
 /// Extract `archive` into `out_dir`, which is created when missing.
-pub fn extract(
-    archive: &Path,
-    password: Option<&str>,
-    out_dir: &Path,
-) -> Result<Report, Error> {
+pub fn extract(archive: &Path, password: Option<&str>, out_dir: &Path) -> Result<Report, Error> {
     if !archive.is_file() {
         return Err(Error(format!("归档不存在：{}", archive.display())));
     }
     fs::create_dir_all(out_dir)?;
-    let log = out_dir.join(".lambda7z.log");
-    // 失败时日志留在 staging 里会被当成「解压出来的文件」，必须先删再报错。
-    let outcome = run(&with_codepage(archive, extract_args(archive, password, out_dir)), &log);
-    let _ = fs::remove_file(&log);
+    let log = log_path("extract");
+    let outcome = run(
+        &with_codepage(archive, extract_args(archive, password, out_dir)),
+        &log,
+        None,
+    );
+    remove_log(&log);
     let output = outcome?;
     let (files, bytes) = count_tree(out_dir);
     Ok(Report {
@@ -375,20 +480,25 @@ pub fn extract_selected_with_progress(
     out_dir: &Path,
     paths: &[String],
     slot: Arc<AtomicI64>,
+    cancel: Option<&AtomicBool>,
 ) -> Result<Report, Error> {
     if !archive.is_file() {
         return Err(Error(format!("归档不存在：{}", archive.display())));
     }
     fs::create_dir_all(out_dir)?;
     slot.store(-1, Ordering::Relaxed);
-    let log = out_dir.join(".lambda7z.log");
+    let log = log_path("extract");
     let watcher = Watch::start(log.clone(), slot);
     let outcome = run(
-        &with_codepage(archive, extract_selected_args(archive, password, out_dir, paths)),
+        &with_codepage(
+            archive,
+            extract_selected_args(archive, password, out_dir, paths),
+        ),
         &log,
+        cancel,
     );
     drop(watcher);
-    let _ = fs::remove_file(&log);
+    remove_log(&log);
     let output = outcome?;
     let (files, bytes) = count_tree(out_dir);
     Ok(Report {
@@ -423,7 +533,7 @@ pub fn create_with_level(
     kind: &str,
     level: Option<u32>,
 ) -> Result<Report, Error> {
-    create_inner(archive, inputs, password, kind, level, None)
+    create_inner(archive, inputs, password, kind, level, None, None)
 }
 
 /// Create an archive and report 7-Zip's progress into `slot` (0…100, `-1`
@@ -443,9 +553,10 @@ pub fn create_with_progress(
     kind: &str,
     level: Option<u32>,
     slot: Arc<AtomicI64>,
+    cancel: Option<&AtomicBool>,
 ) -> Result<Report, Error> {
     slot.store(-1, Ordering::Relaxed);
-    create_inner(archive, inputs, password, kind, level, Some(slot))
+    create_inner(archive, inputs, password, kind, level, Some(slot), cancel)
 }
 
 fn create_inner(
@@ -455,6 +566,7 @@ fn create_inner(
     kind: &str,
     level: Option<u32>,
     progress: Option<Arc<AtomicI64>>,
+    cancel: Option<&AtomicBool>,
 ) -> Result<Report, Error> {
     if inputs.is_empty() {
         return Err(Error("没有要压缩的文件".into()));
@@ -469,11 +581,15 @@ fn create_inner(
     }
     // `a` updates an existing archive; start from a clean one instead.
     let _ = fs::remove_file(archive);
-    let log = archive.with_extension("lambda7z.log");
+    let log = log_path("create");
     let watcher = progress.map(|slot| Watch::start(log.clone(), slot));
-    let outcome = run(&create_args(archive, inputs, password, kind, level), &log);
+    let outcome = run(
+        &create_args(archive, inputs, password, kind, level),
+        &log,
+        cancel,
+    );
     drop(watcher);
-    let _ = fs::remove_file(&log);
+    remove_log(&log);
     let output = outcome?;
     let bytes = fs::metadata(archive).map(|m| m.len()).unwrap_or(0);
     Ok(Report {
@@ -514,6 +630,45 @@ impl Watch {
 }
 
 impl Drop for Watch {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Stops a listing whose `-slt` log grows past `limit`. The 7-Zip header of a
+/// crafted archive can declare millions of entries while the archive itself
+/// stays a few megabytes; the log is where that turns into memory pressure.
+struct LogGuard {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl LogGuard {
+    fn start(log: PathBuf, limit: u64, cancel: Arc<AtomicBool>) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let handle = std::thread::spawn(move || {
+            while !flag.load(Ordering::Relaxed) {
+                if let Ok(meta) = fs::metadata(&log)
+                    && meta.len() > limit
+                {
+                    cancel.store(true, Ordering::Release);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(120));
+            }
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for LogGuard {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(handle) = self.handle.take() {
@@ -570,10 +725,15 @@ pub fn last_percent(text: &str) -> Option<u8> {
     found
 }
 
-fn count_tree(dir: &Path) -> (usize, u64) {    fn walk(path: &Path, files: &mut usize, bytes: &mut u64) {
-        let Ok(entries) = fs::read_dir(path) else { return };
+fn count_tree(dir: &Path) -> (usize, u64) {
+    fn walk(path: &Path, files: &mut usize, bytes: &mut u64) {
+        let Ok(entries) = fs::read_dir(path) else {
+            return;
+        };
         for entry in entries.flatten() {
-            let Ok(kind) = entry.file_type() else { continue };
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
             if kind.is_symlink() {
                 continue;
             }
@@ -597,6 +757,8 @@ unsafe extern "C" {
         argc: c_int,
         argv: *const *const c_char,
         log_path: *const c_char,
+        cancel: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
+        cancel_user: *mut c_void,
         message: *mut c_char,
         message_cap: usize,
     ) -> c_int;
@@ -604,22 +766,25 @@ unsafe extern "C" {
         argc: c_int,
         argv: *const *const c_char,
         log_path: *const c_char,
+        cancel: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
+        cancel_user: *mut c_void,
         sink: unsafe extern "C" fn(*mut c_void, *const u8, usize) -> c_int,
         user: *mut c_void,
         message: *mut c_char,
         message_cap: usize,
     ) -> c_int;
-    fn lambda7z_request_break();
 }
 
-/// Ask the running engine call to stop. The bridge serialises calls and
-/// clears the counter at the start of each one, so a break cannot leak into
-/// the next operation.
-pub fn request_break() {
-    #[cfg(any(target_os = "android", windows))]
-    unsafe {
-        lambda7z_request_break();
+/// Called by 7-Zip's `TestBreakSignal()` on the engine thread. Reads the same
+/// flag the user's cancel command sets; no polling thread and no shared
+/// counter, so a cancel cannot be lost or leak into the next call.
+#[cfg(any(target_os = "android", windows))]
+unsafe extern "C" fn cancel_flag(user: *mut c_void) -> c_int {
+    if user.is_null() {
+        return 0;
     }
+    let flag = unsafe { &*(user as *const AtomicBool) };
+    flag.load(Ordering::Acquire) as c_int
 }
 
 /// Ask Windows consoles to print UTF-8, so the Chinese CLI lines are readable.
@@ -646,7 +811,7 @@ unsafe extern "C" fn stream_sink(user: *mut c_void, data: *const u8, len: usize)
 }
 
 #[cfg(any(target_os = "android", windows))]
-fn run(args: &[String], log: &Path) -> Result<String, Error> {
+fn run(args: &[String], log: &Path, cancel: Option<&AtomicBool>) -> Result<String, Error> {
     let owned: Vec<CString> = args
         .iter()
         .map(|arg| CString::new(arg.as_str()).map_err(|_| Error("参数含 NUL 字节".into())))
@@ -655,6 +820,14 @@ fn run(args: &[String], log: &Path) -> Result<String, Error> {
     let log_path = CString::new(log.to_string_lossy().as_ref())
         .map_err(|_| Error("日志路径含 NUL 字节".into()))?;
     let mut message = vec![0 as c_char; 2048];
+    let cancel_fn = cancel.map(|_| cancel_flag as unsafe extern "C" fn(*mut c_void) -> c_int);
+    let cancel_user = cancel.map_or(std::ptr::null_mut(), |flag| {
+        flag as *const AtomicBool as *mut c_void
+    });
+    let had_password = args
+        .iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| arg.starts_with("-p") && arg.len() > 2);
 
     // SAFETY: all pointers stay alive for the call; the bridge only reads
     // argv and writes at most `message.len()` bytes into `message`.
@@ -663,6 +836,8 @@ fn run(args: &[String], log: &Path) -> Result<String, Error> {
             pointers.len() as c_int,
             pointers.as_ptr(),
             log_path.as_ptr(),
+            cancel_fn,
+            cancel_user,
             message.as_mut_ptr(),
             message.len(),
         )
@@ -671,24 +846,33 @@ fn run(args: &[String], log: &Path) -> Result<String, Error> {
         .to_string_lossy()
         .trim()
         .to_string();
+    if code == 9 {
+        return Err(Error("无法创建引擎日志：检查应用缓存目录权限".into()));
+    }
     // 0 = success, 1 = warning (7-Zip's NExitCode).
     if code == 0 || code == 1 {
         Ok(text)
     } else {
         // 直接把整段日志丢给用户会看到版本横幅与版权声明；只留原因那一行。
         Err(Error(
-            failure_message(&text).unwrap_or_else(|| format!("7-Zip 退出码 {code}")),
+            failure_message_ctx(&text, had_password)
+                .unwrap_or_else(|| format!("7-Zip 退出码 {code}")),
         ))
     }
 }
 
 #[cfg(not(any(target_os = "android", windows)))]
-fn run(_args: &[String], _log: &Path) -> Result<String, Error> {
+fn run(_args: &[String], _log: &Path, _cancel: Option<&AtomicBool>) -> Result<String, Error> {
     Err(Error("本平台没有 7-Zip 引擎".into()))
 }
 
 #[cfg(any(target_os = "android", windows))]
-fn run_stream<F>(args: &[String], log: &Path, mut sink: F) -> Result<(), Error>
+fn run_stream<F>(
+    args: &[String],
+    log: &Path,
+    cancel: Option<&AtomicBool>,
+    mut sink: F,
+) -> Result<(), Error>
 where
     F: FnMut(&[u8]) -> bool,
 {
@@ -702,6 +886,14 @@ where
     let mut message = vec![0 as c_char; 2048];
     let mut callback: &mut dyn FnMut(&[u8]) -> bool = &mut sink;
     let user = (&mut callback as *mut &mut dyn FnMut(&[u8]) -> bool).cast::<c_void>();
+    let cancel_fn = cancel.map(|_| cancel_flag as unsafe extern "C" fn(*mut c_void) -> c_int);
+    let cancel_user = cancel.map_or(std::ptr::null_mut(), |flag| {
+        flag as *const AtomicBool as *mut c_void
+    });
+    let had_password = args
+        .iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| arg.starts_with("-p") && arg.len() > 2);
 
     // SAFETY: argv, log_path, message and the sink reference stay alive for
     // the call; the bridge only reads argv and the sink until it returns.
@@ -710,12 +902,17 @@ where
             pointers.len() as c_int,
             pointers.as_ptr(),
             log_path.as_ptr(),
+            cancel_fn,
+            cancel_user,
             stream_sink,
             user,
             message.as_mut_ptr(),
             message.len(),
         )
     };
+    if code == 9 {
+        return Err(Error("无法创建引擎日志：检查应用缓存目录权限".into()));
+    }
     if code == 0 || code == 1 {
         return Ok(());
     }
@@ -724,12 +921,17 @@ where
         .trim()
         .to_string();
     Err(Error(
-        failure_message(&text).unwrap_or_else(|| format!("7-Zip 退出码 {code}")),
+        failure_message_ctx(&text, had_password).unwrap_or_else(|| format!("7-Zip 退出码 {code}")),
     ))
 }
 
 #[cfg(not(any(target_os = "android", windows)))]
-fn run_stream<F>(_args: &[String], _log: &Path, _sink: F) -> Result<(), Error>
+fn run_stream<F>(
+    _args: &[String],
+    _log: &Path,
+    _cancel: Option<&AtomicBool>,
+    _sink: F,
+) -> Result<(), Error>
 where
     F: FnMut(&[u8]) -> bool,
 {
@@ -743,6 +945,10 @@ where
 /// `Break signaled`, which is what 7-Zip says after it asked for a password on
 /// a console that has none.
 pub fn failure_message(output: &str) -> Option<String> {
+    failure_message_ctx(output, false)
+}
+
+fn failure_message_ctx(output: &str, had_password: bool) -> Option<String> {
     let lines: Vec<&str> = output
         .lines()
         .map(str::trim)
@@ -770,16 +976,54 @@ pub fn failure_message(output: &str) -> Option<String> {
             .filter(|line| !line.starts_with("7-Zip (") && !line.contains("Copyright"))
     })?;
     if chosen.contains("Break signaled") {
-        // 7-Zip 在等密码时被 EOF 打断，对用户等于「缺密码」。
-        return Some("需要密码：这个归档已加密".into());
+        // 7-Zip 在等密码时被 EOF 打断，对用户等于「缺密码」；已经给过密码
+        // 还被打断，只可能是用户取消或引擎主动停止。
+        return Some(if had_password {
+            "已取消：引擎已停止".into()
+        } else {
+            "需要密码：这个归档已加密".into()
+        });
     }
     // `<path> : reason` —— 路径对用户没有信息量，界面自己知道是哪个归档。
     let cleaned = match chosen.split_once(" : ") {
         Some((head, tail)) if head.starts_with('/') || head.contains(":\\") => tail.trim(),
         _ => chosen,
     };
-    let cleaned = cleaned.trim_start_matches("Open ").trim_start_matches("ERROR:").trim();
-    (!cleaned.is_empty()).then(|| cleaned.to_string())
+    let cleaned = cleaned
+        .trim_start_matches("Open ")
+        .trim_start_matches("ERROR:")
+        .trim();
+    let cleaned = redact_private_paths(cleaned);
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+/// Strip private storage paths from an engine message before it reaches the
+/// status bar. A path is not useful there and leaks the app sandbox layout.
+fn redact_private_paths(text: &str) -> String {
+    let mut out = text.to_string();
+    for marker in ["/data/", "content://"] {
+        if let Some(start) = out.find(marker) {
+            let end = out[start..]
+                .find(char::is_whitespace)
+                .map(|offset| start + offset)
+                .unwrap_or(out.len());
+            out.replace_range(start..end, "<path>");
+        }
+    }
+    if let Some(colon) = out.find(":\\") {
+        let start = out[..colon]
+            .rfind(char::is_whitespace)
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let end = out[colon..]
+            .find(char::is_whitespace)
+            .map(|offset| colon + offset)
+            .unwrap_or(out.len());
+        if start < end {
+            out.replace_range(start..end, "<path>");
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -801,7 +1045,10 @@ mod tests {
             failure_message("7-Zip (z) 23.01\nsomething odd happened\n").as_deref(),
             Some("something odd happened")
         );
-        assert_eq!(failure_message("7-Zip (z) 23.01 : Copyright (c) 1999\n"), None);
+        assert_eq!(
+            failure_message("7-Zip (z) 23.01 : Copyright (c) 1999\n"),
+            None
+        );
     }
 
     // 下面三条的字面值来自 2026-11-06 的真机 M5 补测报告。
@@ -855,23 +1102,47 @@ mod tests {
                 "-y",
                 "-sccUTF-8",
                 "-bsp1",
+                "-spd",
+                "-snl-",
+                "-snh-",
                 "-o/cache/out",
                 "-ppassword123",
-                "/cache/in.7z"
+                "/cache/in.7z",
+                "--"
             ]
         );
     }
 
     #[test]
-    fn selected_extraction_appends_the_archive_paths() {
+    fn selected_extraction_appends_the_archive_paths_after_the_sentinel() {
         let args = extract_selected_args(
             Path::new("a.7z"),
             None,
             Path::new("out"),
             &["sub".to_string(), "readme.txt".to_string()],
         );
-        assert_eq!(args.last().unwrap(), "readme.txt");
+        let sentinel = args.iter().position(|arg| arg == "--").expect("-- present");
+        assert_eq!(sentinel, args.len() - 3, "archive name then -- then names");
         assert_eq!(args[args.len() - 2], "sub");
+        assert_eq!(args.last().unwrap(), "readme.txt");
+    }
+
+    #[test]
+    fn hostile_names_stay_after_the_sentinel() {
+        let names = [
+            "-pwrong".to_string(),
+            "-o/tmp/x".to_string(),
+            "-so".to_string(),
+            "@/data/user/0/dev.bern.lambda/files/locations.json".to_string(),
+            "*.txt".to_string(),
+            "../escape".to_string(),
+        ];
+        let args = extract_selected_args(Path::new("a.7z"), None, Path::new("out"), &names);
+        let sentinel = args.iter().position(|arg| arg == "--").expect("-- present");
+        for name in &names {
+            let index = args.iter().position(|arg| arg == name).expect(name);
+            assert!(index > sentinel, "{name} must be a name, not a switch");
+        }
     }
 
     #[test]
@@ -907,23 +1178,70 @@ mod tests {
         );
         assert!(args.contains(&"-tzip".to_string()));
         assert!(args.contains(&"-mem=AES256".to_string()));
-        assert!(!args.contains(&"-mhe=on".to_string()), "7-Zip rejects -mhe on zip");
+        assert!(
+            !args.contains(&"-mhe=on".to_string()),
+            "7-Zip rejects -mhe on zip"
+        );
     }
 
     #[test]
     fn level_is_clamped_and_optional() {
         let none = create_args(Path::new("a.7z"), &[PathBuf::from("dir")], None, "7z", None);
         assert!(!none.iter().any(|a| a.starts_with("-mx")));
-        let fast = create_args(Path::new("a.7z"), &[PathBuf::from("dir")], None, "7z", Some(1));
+        let fast = create_args(
+            Path::new("a.7z"),
+            &[PathBuf::from("dir")],
+            None,
+            "7z",
+            Some(1),
+        );
         assert!(fast.contains(&"-mx=1".to_string()));
-        let absurd = create_args(Path::new("a.7z"), &[PathBuf::from("dir")], None, "7z", Some(42));
-        assert!(absurd.contains(&"-mx=9".to_string()), "levels above 9 are clamped");
+        let absurd = create_args(
+            Path::new("a.7z"),
+            &[PathBuf::from("dir")],
+            None,
+            "7z",
+            Some(42),
+        );
+        assert!(
+            absurd.contains(&"-mx=9".to_string()),
+            "levels above 9 are clamped"
+        );
+    }
+
+    #[test]
+    fn parse_slt_marks_symbolic_and_hard_links() {
+        let text = "----------\nPath = link\nSize = 0\nFolder = -\nSymbolic Link = ../../etc/passwd\n\nPath = hard\nSize = 0\nHard Link = readme.txt\n\nPath = b.txt\nSize = 1\n\n";
+        let entries = parse_slt(text).unwrap();
+        assert!(entries[0].link);
+        assert!(entries[1].link);
+        assert!(!entries[2].link);
+    }
+
+    #[test]
+    fn a_cancel_after_a_password_is_not_reported_as_a_missing_password() {
+        assert_eq!(
+            failure_message_ctx("Break signaled", true).as_deref(),
+            Some("已取消：引擎已停止")
+        );
+        assert_eq!(
+            failure_message_ctx("Break signaled", false).as_deref(),
+            Some("需要密码：这个归档已加密")
+        );
+    }
+
+    #[test]
+    fn private_paths_are_redacted_from_engine_messages() {
+        let message =
+            failure_message("ERROR: Can not open /data/user/0/dev.bern.lambda/cache/x.7z").unwrap();
+        assert!(!message.contains("/data/"));
+        assert!(message.contains("<path>"));
     }
 
     #[test]
     fn parse_slt_skips_the_archive_block() {
         let text = "7-Zip (z) 23.01 : Copyright\n\nListing archive: t.7z\n\n--\nPath = t.7z\nType = 7z\nPhysical Size = 222\n\n----------\nPath = single.txt\nSize = 6\nFolder = -\nEncrypted = +\n\nPath = sub\nSize = 0\nFolder = +\nAttributes = D\n\nPath = sub/b.txt\nSize = 5\n\n";
-        let entries = parse_slt(text);
+        let entries = parse_slt(text).unwrap();
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].path, "single.txt");
         assert_eq!(entries[0].size, 6);
@@ -936,7 +1254,7 @@ mod tests {
     #[test]
     fn parse_slt_handles_crlf_and_a_last_block_without_a_blank_line() {
         let text = "----------\r\nPath = a\\b.txt\r\nSize = 1\r\n";
-        let entries = parse_slt(text);
+        let entries = parse_slt(text).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].size, 1);
     }
@@ -952,7 +1270,7 @@ mod tests {
             b'9', b'4', b'.', b'x', b'm', b'l',
         ]);
         text.extend_from_slice(b"\nSize = 702666\nFolder = -\n\n");
-        let entries = parse_slt_bytes(&text);
+        let entries = parse_slt_bytes(&text).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].path, "亮剑/第1集_6699405806422458894.xml");
         assert_eq!(entries[0].size, 702666);
@@ -962,7 +1280,7 @@ mod tests {
     #[test]
     fn parse_slt_keeps_utf8_names_untouched() {
         let text = "----------\nPath = 亮剑/第1集.xml\nSize = 1\n\n";
-        let entries = parse_slt(text);
+        let entries = parse_slt(text).unwrap();
         assert_eq!(entries[0].path, "亮剑/第1集.xml");
     }
 
@@ -976,7 +1294,7 @@ mod tests {
             text.extend_from_slice(&bytes);
             text.extend_from_slice(b"\nSize = 1\nFolder = -\n\n");
         }
-        let entries = parse_slt_bytes(&text);
+        let entries = parse_slt_bytes(&text).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].path, "編碼測試");
         assert_eq!(entries[1].path, "編碼測試/測試檔案.txt");
@@ -992,7 +1310,10 @@ mod tests {
         assert!(args.contains(&"-bsp2".to_string()));
         assert!(args.contains(&"-bd".to_string()));
         assert!(args.contains(&"-ppw".to_string()));
-        assert!(!args.iter().any(|arg| arg.starts_with("-o")), "no directory output");
+        assert!(
+            !args.iter().any(|arg| arg.starts_with("-o")),
+            "no directory output"
+        );
         assert_eq!(args.last().unwrap(), "sub/a.txt");
     }
 
@@ -1008,7 +1329,11 @@ mod tests {
         assert_eq!(last_percent("\u{8}\u{8}\u{8}  7%"), Some(7));
         assert_eq!(last_percent("100%"), Some(100));
         assert_eq!(last_percent("no progress here"), None);
-        assert_eq!(last_percent("200%"), None, "percentages above 100 are noise");
+        assert_eq!(
+            last_percent("200%"),
+            None,
+            "percentages above 100 are noise"
+        );
         // A stray `%` with no digits before it is not progress.
         assert_eq!(last_percent("100 % done"), None);
     }
@@ -1039,7 +1364,8 @@ mod tests {
     #[test]
     fn host_engine_matches_the_platform() {
         let log = std::env::temp_dir().join("lambda-engine-run-test.log");
-        let result = run(&["7zz".into()], &log);
+        let _ = fs::remove_file(&log);
+        let result = run(&["7zz".into()], &log, None);
         let _ = fs::remove_file(&log);
         #[cfg(any(windows, target_os = "android"))]
         assert!(result.is_ok());

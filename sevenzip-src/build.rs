@@ -42,7 +42,10 @@ fn selected_bundle() -> Bundle {
             exe: "7zr",
         },
         // 7zz = the full standalone build (Alone2): 7z, zip, rar read, tar,
-        // gzip, bzip2, xz.
+        // gzip, bzip2, xz plus the volume/filesystem handlers the sources list
+        // also compiles (APFS, NTFS, Ext, VHD/VHDX/VMDK/QCOW, SquashFS, DMG,
+        // PE/ELF, RPM, CPIO, ARJ, LZH, Zstd, …). The format surface is the
+        // attack surface: see `docs/THIRD-PARTY-NOTICES.md` and the fixtures.
         "7zz" | "alone2" => Bundle {
             list_name: "sources-full.txt",
             variant: "Z",
@@ -54,8 +57,9 @@ fn selected_bundle() -> Bundle {
 
 fn source_paths(base: &Path, list_name: &str) -> Vec<PathBuf> {
     let source_root = base.join("vendor").join("7zsrc");
-    let list = fs::read_to_string(base.join("vendor").join(list_name))
-        .unwrap_or_else(|_| panic!("vendor/{list_name} is missing: run python tools/gen_sources.py"));
+    let list = fs::read_to_string(base.join("vendor").join(list_name)).unwrap_or_else(|_| {
+        panic!("vendor/{list_name} is missing: run python tools/gen_sources.py")
+    });
     let sources: Vec<PathBuf> = list
         .lines()
         .map(str::trim)
@@ -63,7 +67,11 @@ fn source_paths(base: &Path, list_name: &str) -> Vec<PathBuf> {
         .map(|line| source_root.join(line))
         .collect();
     for source in &sources {
-        assert!(source.is_file(), "missing 7-Zip source: {}", source.display());
+        assert!(
+            source.is_file(),
+            "missing 7-Zip source: {}",
+            source.display()
+        );
     }
     sources
 }
@@ -74,6 +82,7 @@ fn main() {
     println!("cargo:rerun-if-changed=vendor/sources-full.txt");
     println!("cargo:rerun-if-changed=vendor/7zsrc");
     println!("cargo:rerun-if-changed=bridge/lambda7z.cpp");
+    println!("cargo:rerun-if-changed=../docs/THIRD-PARTY-NOTICES.md");
     println!("cargo:rerun-if-env-changed=LAMBDA_7Z_BUNDLE");
 
     match env::var("CARGO_CFG_TARGET_OS").as_deref() {
@@ -87,9 +96,46 @@ fn main() {
     }
 }
 
+/// Copy the notice and the two 7-Zip license texts into the package. The
+/// repository is not shipped with the APK/installer; these files must be.
+fn stage_notices() {
+    let base = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let Some(workspace) = base.parent() else {
+        return;
+    };
+    let notice = workspace.join("docs/THIRD-PARTY-NOTICES.md");
+    let licenses = [
+        (
+            workspace.join("sevenzip-src/vendor/7zsrc/DOC/License.txt"),
+            "7-Zip-License.txt",
+        ),
+        (
+            workspace.join("sevenzip-src/vendor/7zsrc/DOC/unRarLicense.txt"),
+            "unRarLicense.txt",
+        ),
+    ];
+    let targets = [
+        workspace.join("target/bern/android/project/app/src/main/assets/notices"),
+        workspace.join("target/bern/windows/app/runtime/notices"),
+    ];
+    for dir in targets {
+        if fs::create_dir_all(&dir).is_err() {
+            continue;
+        }
+        let _ = fs::copy(&notice, dir.join("THIRD-PARTY-NOTICES.md"));
+        for (source, name) in &licenses {
+            let _ = fs::copy(source, dir.join(name));
+        }
+    }
+}
+
 fn build_android() {
+    stage_notices();
     let bundle = selected_bundle();
-    println!("cargo:rustc-env=LAMBDA_7Z_ENGINE=7-Zip 26.04 ({})", bundle.exe);
+    println!(
+        "cargo:rustc-env=LAMBDA_7Z_ENGINE=7-Zip 26.04 ({})",
+        bundle.exe
+    );
     println!("cargo:rustc-env=LAMBDA_7Z_EXE={}", bundle.exe);
     println!(
         "cargo:warning=7-Zip bundle: {} ({})",
@@ -118,6 +164,7 @@ fn build_android() {
         // 7zr (Alone7z) vs 7zz (Alone2) build variant: the console code reads
         // this macro to decide which verbs and formats it advertises.
         .define(&format!("Z7_PROG_VARIANT_{}", bundle.variant), None)
+        .flag_if_supported("-fstack-protector-strong")
         .flag_if_supported("-fexceptions")
         .flag_if_supported("-pthread")
         .file(base.join("bridge").join("lambda7z.cpp"));
@@ -216,18 +263,26 @@ fn build_android() {
                 let _ = fs::copy(&shared, jni.join("libc++_shared.so"));
             }
         } else {
-            println!("cargo:warning=libc++_shared.so not found in the NDK sysroot; the APK may fail to load");
+            println!(
+                "cargo:warning=libc++_shared.so not found in the NDK sysroot; the APK may fail to load"
+            );
         }
     } else {
-        println!("cargo:warning=could not locate the NDK sysroot lib dir; C++ runtime symbols may stay unresolved");
+        println!(
+            "cargo:warning=could not locate the NDK sysroot lib dir; C++ runtime symbols may stay unresolved"
+        );
     }
     println!("cargo:rustc-link-lib=dylib=c++_shared");
     println!("cargo:rustc-link-lib=dl");
 }
 
 fn build_windows() {
+    stage_notices();
     let bundle = selected_bundle();
-    println!("cargo:rustc-env=LAMBDA_7Z_ENGINE=7-Zip 26.04 ({})", bundle.exe);
+    println!(
+        "cargo:rustc-env=LAMBDA_7Z_ENGINE=7-Zip 26.04 ({})",
+        bundle.exe
+    );
     println!("cargo:rustc-env=LAMBDA_7Z_EXE={}", bundle.exe);
 
     let base = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
@@ -264,7 +319,10 @@ fn build_windows() {
         .flag_if_supported("/Gy")
         .flag_if_supported("/GF")
         .flag_if_supported("/GR-")
-        .flag_if_supported("/GS-")
+        // Upstream's Build.mak adds -GS- to every MSVC build. Lambda parses
+        // untrusted archives in-process next to the password store, so keep
+        // the stack cookie and add Control Flow Guard instead.
+        .flag_if_supported("/guard:cf")
         .flag_if_supported("/Zc:wchar_t")
         .flag_if_supported("/Zc:forScope")
         .flag_if_supported("/Zc:throwingNew")
@@ -356,6 +414,10 @@ fn ndk_lib_dir() -> Option<PathBuf> {
     } else {
         "i686-linux-android"
     };
-    let dir = host.join("sysroot").join("usr").join("lib").join(triple_dir);
+    let dir = host
+        .join("sysroot")
+        .join("usr")
+        .join("lib")
+        .join(triple_dir);
     dir.is_dir().then_some(dir)
 }

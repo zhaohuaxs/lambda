@@ -9,7 +9,7 @@
 //! Names that are valid UTF-8 are always decoded as UTF-8; only the remaining
 //! bytes take part in detection.
 
-use encoding_rs::{Encoding, BIG5, EUC_JP, EUC_KR, GB18030, SHIFT_JIS, WINDOWS_1252};
+use encoding_rs::{BIG5, EUC_JP, EUC_KR, Encoding, GB18030, SHIFT_JIS, WINDOWS_1252};
 
 const CANDIDATES: [&str; 7] = [
     "gb18030", "big5", "cp932", "euc-kr", "euc-jp", "cp1252", "cp437",
@@ -251,7 +251,11 @@ mod tests {
 
     fn encoded(encoding: &'static Encoding, text: &str) -> Vec<u8> {
         let (bytes, _, had_errors) = encoding.encode(text);
-        assert!(!had_errors, "{text:?} cannot be encoded as {}", encoding.name());
+        assert!(
+            !had_errors,
+            "{text:?} cannot be encoded as {}",
+            encoding.name()
+        );
         bytes.into_owned()
     }
 
@@ -348,10 +352,7 @@ mod tests {
     #[test]
     fn recognises_cp437() {
         // "Café/Ñandú.txt" in CP437: 0x82 é, 0xA5 Ñ, 0xA3 ú.
-        let names = vec![
-            b"Caf\x82".to_vec(),
-            b"Caf\x82/\xA5and\xA3.txt".to_vec(),
-        ];
+        let names = vec![b"Caf\x82".to_vec(), b"Caf\x82/\xA5and\xA3.txt".to_vec()];
         let detected = detect(&names);
         assert_eq!(detected, NameEncoding::Cp437);
         assert_eq!(detected.decode(&names[1]), "Café/Ñandú.txt");
