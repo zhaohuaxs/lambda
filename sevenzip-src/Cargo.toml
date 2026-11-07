@@ -1,0 +1,16 @@
+[package]
+name = "sevenzip-src"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+build = "build.rs"
+
+[build-dependencies]
+cc = "1.2"
+
+[dependencies]
+chardet_rs = { package = "chardet-rs", version = "=0.1.0" }
+chardetng = "1.0"
+encoding_rs = "0.8"
