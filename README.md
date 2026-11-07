@@ -15,7 +15,7 @@ $ lambda extract -p password123 archive.7z
 [lambda] 输出目录：archive
 [lambda] 写入 19373 字节 · 引擎 7-Zip 26.04 (7zz)
 ```
-（上面是 Windows 独立 CLI 的验收入口，1024 文件 / 19,373 字节已实测。）
+（上面是 Windows 独立 CLI 的验收入口；文件数、字节数随归档而定。）
 
 ## 用户操作
 
@@ -52,6 +52,14 @@ bern check
 cargo test --workspace
 ```
 
+Windows 桌面应用（WinUI 3）：
+
+```powershell
+# 在仓库根目录执行
+bern build --target windows     # 生成 target/bern/windows/Lambda/Lambda.exe；C++ 阶段可能因 /MP 报 C3859
+cmd /c build-sequential.cmd     # 串行重编 7-Zip 并注入 lambda7z-msvc.rsp；每次 bern build 后都要跑
+```
+
 Android 构建（按本机安装路径填写以下环境变量）：
 
 ```bash
@@ -67,7 +75,9 @@ bern build --target android      # target/bern/android/Lambda.apk
 bern package --target android    # target/bern/dist/*.apk / *.aab（无 --release 参数）
 ```
 
-真机安装：`adb -s <serial> install -r target/bern/dist/Lambda-0.1.0-android.apk`。同一台设备可能同时存在多条 adb transport（USB / 无线调试 / mDNS），**所有 adb 命令都要带 `-s`**。
+发布包签名读取 `BERN_ANDROID_KEYSTORE` / `BERN_ANDROID_KEYSTORE_PASSWORD` / `BERN_ANDROID_KEY_ALIAS`（`BERN_ANDROID_KEY_PASSWORD` 可选，默认取 store 密码）；未配置时 Gradle 回退到 debug 签名，`package` 会提示产物是 debug key 签的。
+
+真机安装：`adb -s <serial> install -r target/bern/dist/Lambda-0.1.0-android.apk`。同一台设备可能同时存在多条 adb transport（USB / 无线调试 / mDNS），**所有 adb 命令都要带 `-s`**；如果机器上装的是 debug 签名的旧包，换发布签名包前要先 `adb uninstall dev.bern.lambda`，否则 `install -r` 会报签名不一致。
 
 ## 工程结构
 
@@ -80,18 +90,19 @@ bern package --target android    # target/bern/dist/*.apk / *.aab（无 --releas
 | `lambda-cli/` | 独立 `[[bin]] name = "lambda"`，只依赖 `sevenzip-src`，不拉 Bern 运行时 |
 | `Bern.toml` | `[targets.windows]` + `[targets.android]`（`abis = ["arm64-v8a"]`） |
 
-### Android 是怎么把 7z 源码接进去的
+### 引擎是怎么接进应用的
 
-Bern 0.1.7 的 Android 后端把应用 crate 链成唯一的 `libbern_app.so`（`crates/bern-backend-compose/src/glue.rs`），并且**没有应用侧 Kotlin / 自定义 manifest / 额外 native 库的注入点**：`BernNative` 的 JNI 表固定，Kotlin 目录每次构建被 `Mirror` 裁剪。因此不能走「加一个 JNI 方法」的常规路线。
+Android 侧的约束最硬：Bern 0.1.10 的后端把应用 crate 链成唯一的 `libbern_app.so`（`crates/bern-backend-compose/src/glue.rs`），并且**没有应用侧 Kotlin / 自定义 manifest / 额外 native 库的注入点**：`BernNative` 的 JNI 表固定，Kotlin 目录每次构建被 `Mirror` 裁剪。因此不能走「加一个 JNI 方法」的常规路线。Windows 复用同一份源码与桥接层，差别只在编译方式和链接注入。
 
 本工程的做法：
 
-1. 从官方 `CPP/7zip/Bundles/Alone7z/makefile.gcc`（精简版 7zr）与 `7zip_gcc.mak` 的显式规则派生出 `vendor/sources.txt`（**164 个单元：131 `.cpp` + 33 `.c`**，含 7z handler、LZMA/LZMA2、BCJ/BCJ2、Delta、7zAES/SHA256）。`tools/gen_sources.py` 可重生成。
-2. `build.rs` 用 `cc` crate + Bern 已设置的 `CC_aarch64_linux_android` 交叉编译。**不能用 `.cpp(true)`**：cc-rs 会把 `.c` 也交给 clang++，7-Zip 的 `C/MtDec.h` 依赖 C 的 tag/typedef 命名空间，会报 `typedef redefinition`。改为 `cpp(false)`，靠扩展名让 clang 自动区分 C / C++。
-3. 🔴 **必须把所有 `.o` 用 `ld.lld -r` 合并成单一可重定位对象再打包**。7-Zip 的 codec / archive handler 靠 `*Reg.cpp` 里的全局构造函数注册（`REGISTER_ARC_*` 宏 → `.init_array`）；普通 `.a` 会被链接器按「解析未定义符号」裁剪，结果 `.so` 里没有 `NArchive::N7z::CHandler`，运行时报「找不到处理归档的代码」。另外 Cargo 的 `OUT_DIR` 在改 `build.rs` 后不变，归档前要 `remove_file`，否则旧成员残留。
-4. `bridge/lambda7z.cpp` 导出 `lambda7z_run(argc, argv, log_path, message, cap)`：用 `dup2` 把 stdout/stderr 临时重定向到日志文件，**进程内调用 7zr 的 `main`**（`MainAr.cpp` 里的 `int Z7_CDECL main(int, char*[])`，符号未 mangle），返回退出码并把日志尾部交回 Rust；`std::mutex` 串行化调用。
-5. Rust 侧构造官方 7zr 参数：`x -y -o<dir> -p<pw> <archive>` / `a -t7z -y -p<pw> -mhe=on <out.7z> <inputs>`。
-6. 🔴 **C++ 运行时必须动态链 NDK 的 `libc++_shared.so` 并随包**。早期「静态链 `c++_static`」的写法在桌面编译能过、符号也能解析，但真机 `dlopen` 会崩。`build.rs` 从 `CC_<target>` 反推 NDK sysroot，把 `libc++_shared.so` 复制到**私有的 `OUT_DIR/ndk_shared`**（`-L` 只指这个目录），再复制到 `target/bern/android/project/app/src/main/jniLibs/arm64-v8a/`，最后 `println!("cargo:rustc-link-lib=dylib=c++_shared")`。Bern 每次构建都会重建 `jniLibs`，所以这一步每轮都要做。
+1. 从官方 `Bundles/Alone2/makefile.gcc`（7zz 全量）和 `Bundles/Alone7z/makefile.gcc`（7zr 精简）配合 `7zip_gcc.mak` 的显式规则派生出两份清单：`vendor/sources-full.txt`（**324 个单元**，默认）与 `vendor/sources.txt`（**164 个单元：131 `.cpp` + 33 `.c`**，`LAMBDA_7Z_BUNDLE=7zr` 时使用）。`tools/gen_sources.py` 可重生成。
+2. Android 上 `build.rs` 用 `cc` crate + Bern 已设置的 `CC_aarch64_linux_android` 交叉编译。**不能用 `.cpp(true)`**：cc-rs 会把 `.c` 也交给 clang++，7-Zip 的 `C/MtDec.h` 依赖 C 的 tag/typedef 命名空间，会报 `typedef redefinition`。改为 `cpp(false)`，靠扩展名让 clang 自动区分 C / C++。
+3. 🔴 **Android 必须把所有 `.o` 用 `ld.lld -r` 合并成单一可重定位对象再打包**。7-Zip 的 codec / archive handler 靠 `*Reg.cpp` 里的全局构造函数注册（`REGISTER_ARC_*` 宏 → `.init_array`）；普通 `.a` 会被链接器按「解析未定义符号」裁剪，结果 `.so` 里没有 `NArchive::N7z::CHandler`，运行时报「找不到处理归档的代码」。另外 Cargo 的 `OUT_DIR` 在改 `build.rs` 后不变，归档前要 `remove_file`，否则旧成员残留。
+   Windows 没有 `ld -r`：`build.rs` 用 MSVC 编译同样 324 个单元（另加 5 个 Windows 系统单元），把全部 `.o` 写进 `lambda7z-msvc.rsp`；`build-sequential.cmd` 把它注入 Bern 生成的链接命令，CLI 则链 `lambda7z.lib` 并加 `/WHOLEARCHIVE:lambda7z`。注册对象同样不能被裁掉，而且 `bern build --target windows` 每次都会重写 `build.bat`，所以包装脚本必须跟在每次构建之后。
+4. `bridge/lambda7z.cpp` 导出 `lambda7z_run(...)` 与 `lambda7z_run_stream(...)`：用 `dup2`（Windows 上是 `_dup2`）把 stdout/stderr 临时重定向到日志文件或管道，**进程内调用 `MainAr.cpp` 的 `lambda7z_engine_main`**（`Z7_LAMBDA_INPROCESS` 下的稳定 C 入口；Windows 直接接收 argv，不再通过 `GetCommandLineW()` 重读命令行），返回退出码并把日志尾部交回 Rust；`std::mutex` 串行化调用。Windows 的 WinUI 进程没有控制台，桥接层会先把无效的 CRT 标准流 `_wfreopen(NUL)` 再重定向，否则 `fwrite(stdout)` 静默失败。取消走 `lambda7z_request_break()` 递增 `NConsoleClose::g_BreakCounter`，每次调用开始清零。
+5. Rust 侧构造官方 7zz 参数：`x -y -o<dir> -p<pw> <archive>` / `a -t7z -y -p<pw> -mhe=on <out.7z> <inputs>`。
+6. 🔴 **Android 的 C++ 运行时必须动态链 NDK 的 `libc++_shared.so` 并随包**。早期「静态链 `c++_static`」的写法在桌面编译能过、符号也能解析，但真机 `dlopen` 会崩。`build.rs` 从 `CC_<target>` 反推 NDK sysroot，把 `libc++_shared.so` 复制到**私有的 `OUT_DIR/ndk_shared`**（`-L` 只指这个目录），再复制到 `target/bern/android/project/app/src/main/jniLibs/arm64-v8a/`，最后 `println!("cargo:rustc-link-lib=dylib=c++_shared")`。Bern 每次构建都会重建 `jniLibs`，所以这一步每轮都要做。
 
 `content://` 的单文件由 `bern::files::open()` 复制进 `cache_dir()/lambda/input`，文档树由 `bern::platform::import_folder()` 递归导入；结果通过 `bern::platform::export_path()`（文件与目录都能递归导出）写回用户选中的文件夹。全部路径在应用私有目录里，不需要 `READ/WRITE_EXTERNAL_STORAGE` 权限。
 
@@ -106,30 +117,33 @@ Bern 0.1.7 的 Android 后端把应用 crate 链成唯一的 `libbern_app.so`（
 - **边界**：只认文本后缀，不解析 XML 实体、不执行内容、不提供编辑 / 搜索 / 高亮；NUL 与其他控制字符显示成空格。
 - **图片**：`picture.rs` 用 `bern::files::serve("lambda-picture", ...)` 给 `Image(source:)` 提供带一次性 token 的 URL。宿主在后台把流读完，再按控件尺寸采样解码；窗口关闭/切换预览时 token 被移除，流式 7z 调用随之中止。只接受 PNG / JPEG / GIF / WebP / BMP / APNG 等双端解码器都稳的格式；条目超过 64 MB 或像素超过 5000 万时只显示拒绝原因。状态行显示「PNG · 1024 × 1024 · 44.3 KB」这类信息。图片模态不设固定高度：`Adaptive` 放在模态外按窗口宽度选控件尺寸，Modal 只按内容量高，底部不再留空。同级图片在打开预览时按归档表当前顺序收集（不含文件夹与没有密码的加密图片），页脚提供「上一张 / 第 N / M 张 / 下一张」，首尾禁用；只有一张时不出现翻页行。不提供缩放、平移，也不做手势滑动。
 
-## 体积实测（2026-11-06 最终构建）
+## 体积实测（2026-11-08，7-Zip 26.04 release）
 
 | 产物 | 大小 | 说明 |
 |---|---:|---|
-| Windows `target/release/lambda.exe` | 158,720 B | 独立 CLI（155 KB） |
-| **Windows CLI 交付合计** | **2,066,432 B（1.97 MB）** | zip 后约 0.9–1.1 MB |
-| Android `Lambda-0.1.0-android.apk`（release, **7zz 全格式引擎**） | **3,977,546 B（3.79 MB）** | 当前产物 |
-| Android `Lambda-0.1.0-android.aab`（**7zz**） | **9,209,550 B（8.78 MB）** | |
-| `libbern_app.so`（release, strip, **7zz**） | 3,531,008 B | 7zr 精简版为 2,129,136 B（309 个 C++ 单元换 164 个） |
-| `libc++_shared.so`（NDK 28.2） | 1,253,544 B | 必须随包，否则真机 `dlopen` 失败 |
-| hello 空项目基线（同机） | 2.2 MB APK / 5.2 MB AAB | 最终 Lambda 相对基线 **+1.6 MB APK / +3.6 MB AAB** |
+| Windows `target/release/lambda.exe` | 5,210,624 B（5.21 MB） | 独立 CLI，单文件；7zz 全量引擎静态链入，不再附带 `7z.exe` / `7z.dll`；zip 后 2.23 MB |
+| Android `Lambda-0.1.0-android.apk`（release，发布密钥签名） | **5,675,375 B（5.68 MB）** | 7zz 全量引擎；仅 arm64-v8a |
+| Android `Lambda-0.1.0-android.aab` | **12,818,220 B（12.82 MB）** | 含 `BUNDLE-METADATA` 里的 debug symbols 与 proguard map，不能和 APK 直接比 |
+| `libbern_app.so`（release, strip, 7zz） | 7,674,432 B（7.67 MB） | 324 个 7-Zip 单元 + Rust 引擎与编码依赖 |
+| `libc++_shared.so`（NDK 28.2） | 1,253,544 B（1.25 MB） | 必须随包，否则真机 `dlopen` 失败 |
+| `classes.dex`（release） | 3,548,160 B（3.55 MB） | |
+
+Debug 构建不能当交付体积：Android debug APK 38,583,985 B（38.58 MB；未 strip 的 `.so` 102,133,472 B，strip 后 17,412,216 B），Windows 应用 debug `Lambda.exe` 22,447,616 B（22.45 MB）。
+
+Windows CLI 从上一版「交付合计」2,066,432 B，变成 5,210,624 B 的单文件：全量 7zz 引擎和编码依赖都进了 exe，换来零外部依赖。Android release APK 从 3,977,546 B 增至 5,675,375 B（约 +1.70 MB），增长来自 7-Zip 26.04 源码、全量格式集，以及旧编码检测与预览引入的 Rust 依赖（`chardet-rs` / `encoding_rs` / `regex` 等）。
 
 ## 已知边界
 
-- **引擎现在是 7zz（全格式）**：7z（LZMA / LZMA2 / BCJ / BCJ2 / Delta / Copy + AES）、ZIP（含 `-mem=AES256` 创建）、RAR / RAR5（只读）、TAR、gz / bz2 / xz / zst、ISO、CAB。`LAMBDA_7Z_BUNDLE=7zr` 仍可编回精简版（164 单元），但只有 7z / LZMA / XZ / Split，体积省 ~1.2 MB `.so`。
-- **压缩已外抛，解压还是同步**：压缩走 `wake::Waker` + worker 线程，进度与取消都不阻塞命令队列；**解压与 `import_folder` / `export_path` 仍在专用 engine 线程上同步跑**，大文件不会冻结界面但会阻塞后续命令（「点了没反应」）。注意 Android 压缩阶段的取消只能等 `7zz` 返回（实测 384 MB 从 17% 取消到落地 +61 s）。
+- **引擎现在是 7zz（全格式）**：7z（LZMA / LZMA2 / BCJ / BCJ2 / Delta / Copy + AES）、ZIP（含 `-mem=AES256` 创建）、RAR / RAR5（只读）、TAR、gz / bz2 / xz / zst、ISO、CAB。`LAMBDA_7Z_BUNDLE=7zr` 仍可编回精简版（164 单元），但只有 7z / LZMA / XZ / Split；体积会明显变小（26.04 下未单独实测）。
+- **压缩、解压、预览都在后台线程**：任务由 `wake::Waker` 驱动，进度与取消都不阻塞界面；`import_folder` / `export_path` 也在任务线程里跑。引擎调用仍由桥接层的 `std::mutex` 串行，第二个 7-Zip 操作要排队。Windows 取消会把 `g_BreakCounter` 置位，7-Zip 在下一个回调点退出；**Android 的引擎阶段取消要等 `7zz` 返回**（实测 384 MB 压缩从 17% 取消到落地 +61 s），进度区会提前说明。
 - **`import_folder` / `export_path` 有上限**：Kotlin 实现限制 10,000 文件 / 10,000 目录 / 32 层导入、导出 128 层；超大文件夹要分块。
-- **密码明文**：UI `TextInput` 未遮蔽，7zr 通过 argv `-p` 传递（同进程内无命令行泄露，但内存里是明文）。任务记录 `jobs/current.json` 只写 `locked: true`，**不存密码**；重试加密任务要重新输。
+- **密码明文**：UI `TextInput` 未遮蔽，引擎通过 argv `-p` 传递（同进程内无命令行泄露，但内存里是明文）。任务记录 `jobs/current.json` 只写 `locked: true`，**不存密码**；重试加密任务要重新输。
 - **旧编码 ZIP 名**：ZIP 没打 UTF-8 标志时，7-Zip 的 Linux 版把文件名的原始字节原样写进 `-slt` 日志；列表按字节解析，并把整包所有旧编码名拼起来检测一次（chardetng 的 CJK 结果 + 限定候选集的 chardet-rs），支持 GBK/GB18030、Big5、Shift_JIS、EUC-KR、EUC-JP、Windows-1252 和 CP437。**Windows 引擎在输出前就会按 OEM 代码页转换名字**，所以引擎层会先读 ZIP 中央目录的原始名、跑同一套检测，再用 `-mcp=<代码页>` 让列表/解压/预览按同一编码解码。剩余风险：整包只有很短的名字时仍可能判错（例如单名 Big5 会判成 EUC-JP）；混合编码包按 UTF-8 合法性逐名处理，未打标志但恰好是合法 UTF-8 的旧编码名会被当成 UTF-8；CP437 与 CP1252 的单字节文本可能混淆。
-- **文本预览只保证 UTF-8 / ASCII 条目名（Android）**：旧编码 ZIP 名在列表里能正确显示，但 Android 的 7-Zip 仍按原始字节匹配条目，把解码后的名字交回去会匹配失败，预览报错；Windows 走 `-mcp`，显示名与条目路径一致。后续三条路线（7-Zip 改码页 / Rust 兜底读 ZIP 中央目录 / 保留原始字节匹配）见 `Docs/text-preview-plan.md` 第 9 节。
+- **文本预览只保证 UTF-8 / ASCII 条目名（Android）**：旧编码 ZIP 名在列表里能正确显示，但 Android 的 7-Zip 仍按原始字节匹配条目，把解码后的名字交回去会匹配失败，预览报错；Windows 走 `-mcp`，显示名与条目路径一致。后续三条路线（7-Zip 改码页 / Rust 兜底读 ZIP 中央目录 / 保留原始字节匹配）都还没做。
 - **文本预览按后缀白名单**：不在名单里的无后缀文件与二进制不进入预览；页环只保留最近 16 页，更早的页不能回翻；XML 不解析实体；很短的样本仍可能判错编码。
 - **图片预览的边界**：只认 png / jpg / jpeg / jfif / gif / webp / bmp / apng；单条 64 MB、5000 万像素上限。Bern 的宿主会把整条流读进内存再按显示尺寸采样，因此内存由上限兜底，而不是流式分页；关闭预览会丢弃引擎 token 并中止 7z，但宿主按 URL 保留的解码缓存（64 MB LRU）不保证立即清空。多图只在打开预览时按当前层与表格顺序取同级图片，翻页用按钮、不做手势；切换排序或进出目录前翻页列表不会更新。不支持缩放、平移，也不对 EXIF 方向以外的元数据做解释。
 - **压缩忽略 `import_folder` 的深度限制**：`backend::import_folder_with` 自己 `files::list` 递归，预算 200,000 条 / 32 层（`platform::import_folder` 会把整棵授权树搬进来，不能用）。
-- **7zr 的 `main()` 会临时安装 SIGINT/SIGTERM 处理器**（`CCtrlHandlerSetter` 析构时恢复），并在 stdout/stderr 上输出；桥接层用 `dup2` 重定向到私有日志、mutex 串行化，且不会调用 `exit()`（只在收到多次中断信号时）。真机多次解压/压缩后进程仍存活，未破坏宿主。
+- **7zz 的 console front-end（`MainAr.cpp`）会临时安装 Ctrl-C / SIGINT/SIGTERM 处理器**（`CCtrlHandlerSetter` 析构时恢复），并在 stdout/stderr 上输出；桥接层用 `dup2` / `_dup2` 重定向到私有日志、mutex 串行化，正常路径不调用 `exit()`（只在收到多次中断信号时）。真机多次解压/压缩后进程仍存活，未破坏宿主。
 
 ## 许可
 
