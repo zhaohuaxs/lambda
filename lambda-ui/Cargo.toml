@@ -1,0 +1,12 @@
+[package]
+name = "lambda-ui"
+description = "Lambda: the interface"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+bern.workspace = true
+lambda-protocol.workspace = true

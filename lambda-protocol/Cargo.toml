@@ -1,0 +1,11 @@
+[package]
+name = "lambda-protocol"
+description = "Lambda: the state and the commands that change it"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+bern.workspace = true
