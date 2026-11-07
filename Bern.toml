@@ -1,0 +1,61 @@
+# Lambda - Bern + 7-Zip 双端验证工程
+# Windows 与 Android：都把 7-Zip 26.04 源码编进应用（无外部 exe/dll）。
+# 两端共用一套 UI/协议，文件选择经 Bern 的 pick: 生成系统文件选择器。
+
+[app]
+id = "lambda"
+bundle_id = "dev.bern.lambda"
+version = "0.1.0"
+name = { "zh-Hans" = "Lambda", "en" = "Lambda" }
+
+# 由 icon/build_icons.py 生成：Windows 用多尺寸 ICO，Android 用自适应图标，
+# 其他平台用 1024 方形 PNG。
+[app.icon]
+default = "assets/icon/lambda-logo.png"
+windows = "assets/icon/lambda-logo.ico"
+android = "assets/icon/android/res"
+
+[languages]
+supported = ["zh-Hans", "en"]
+default = "zh-Hans"
+
+[layouts]
+compact_below = 600
+medium_below = 1024
+
+[protocol]
+package = "lambda-protocol"
+source = "lambda-protocol/src/lib.rs"
+
+[engine]
+package = "lambda-core"
+type = "lambda_core::LambdaEngine"
+
+# 双击归档、“打开方式”和把文件拖到 exe 上：系统把文件交给引擎。
+# menu 是安装包在资源管理器右键菜单里的一项（Windows 11 在“显示更多选项”下）。
+[[app.opens]]
+files = [
+  ".7z", ".zip", ".zipx", ".rar",
+  ".tar", ".gz", ".tgz", ".bz2", ".tbz", ".tbz2", ".xz", ".txz", ".lzma", ".lz4", ".zst", ".tzst",
+  ".cab", ".iso", ".arj", ".lzh", ".lha", ".rpm", ".deb", ".cpio",
+  ".wim", ".msi", ".chm", ".dmg", ".xar", ".z", ".taz", ".tpz",
+  ".vhd", ".vhdx", ".squashfs"
+]
+menu = { "zh-Hans" = "用 Lambda 打开", "en" = "Open with Lambda" }
+
+[ui]
+package = "lambda-ui"
+sources = ["lambda-ui/src/lib.rs"]
+root = "app"
+
+[targets.windows]
+platform = "windows"
+channels = ["ipc"]
+frontends = ["winui3"]
+
+# 两端都把 7-Zip 26.04 源码编进应用（sevenzip-src），
+# 由 SAF 文件选择器提供 content:// 输入。
+[targets.android]
+platform = "android"
+channels = ["ipc"]
+abis = ["arm64-v8a"]

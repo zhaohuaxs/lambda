@@ -1,0 +1,21 @@
+[workspace]
+resolver = "3"
+members = ["sevenzip-src", "lambda-protocol", "lambda-core", "lambda-ui", "lambda-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+bern = "=0.1.10"
+lambda-protocol = { path = "lambda-protocol" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
