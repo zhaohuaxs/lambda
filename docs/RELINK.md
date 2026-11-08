@@ -17,7 +17,7 @@ Lambda 把 7-Zip 26.04 的 C/C++ 源码静态链进两个产物：
 ## Windows
 
 1. 修改 `sevenzip-src/vendor/7zsrc` 下的源码，或替换为同版本的修改副本。
-2. `cargo build --release --target x86_64-pc-windows-msvc -p lambda-core` 生成 Rust 引擎与 `target/<profile>/lambda7z-msvc.rsp`。Bern 的 glue 构建目录是 `target/bern-glue-windows/<profile>/`，`build.rs` 会把 rsp 写在那里。
+2. `cargo build --release --target x86_64-pc-windows-msvc -p lambda-core`（或 Bern 的 glue 构建）生成 Rust 引擎与 `lambda7z-msvc.rsp`。rsp 的实际位置是构建时 `CARGO_TARGET_DIR` 的 profile 目录：直接在工作区根跑 cargo 时是 `target/release/lambda7z-msvc.rsp`，Bern glue 构建时是 `target/bern-glue-windows/release/lambda7z-msvc.rsp`（`build-sequential.cmd` 用的是后者）。
 3. `build-sequential.cmd release`：脚本会把 `@lambda7z-msvc.rsp` 与 `/guard:cf` 注入 Bern 生成的 `build.bat`，然后编译链接出 `target/bern/windows/app/.../Lambda.exe`。
 4. 重链接只需要：修改后的 7-Zip 源码、本仓库的 `sevenzip-src/build.rs` 与 `bridge/lambda7z.cpp`、以及 `lambda7z-msvc.rsp` 中列出的目标文件集合。rsp 是构建产物，若需要单独交付，可在上述构建目录中找到。
 

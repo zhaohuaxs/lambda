@@ -34,4 +34,4 @@
 | `libc`（Android） | Apache-2.0 OR MIT |
 | `cc`（构建依赖） | MIT OR Apache-2.0 |
 
-其余传递依赖同样按 `Cargo.lock` 中各自的 `license` 字段分发；发行时须随包保留本文件与各许可原文。`tools/make_sbom.py` 可生成完整的包-许可清单。Windows 安装包与 Android APK 的 `assets/notices/` 由 `sevenzip-src/build.rs` 在构建时复制。
+其余传递依赖同样按 `Cargo.lock` 中各自的 `license` 字段分发；发行时须随包保留本文件与各许可原文。`tools/make_sbom.py` 可生成完整的包-许可清单（含 7-Zip 与 NDK）。Android APK 的 `assets/notices/` 与 Windows 安装包的 `runtime/notices/` 由 `sevenzip-src/build.rs` 在构建时复制。
