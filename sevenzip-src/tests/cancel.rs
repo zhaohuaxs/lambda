@@ -133,6 +133,7 @@ fn cancelling_a_running_extraction_stops_the_engine() {
     let cancel_at = Instant::now();
     cancel.store(true, Ordering::Release);
     let message = handle.join().unwrap().unwrap_err().0;
+    println!("extraction cancel latency: {:?}", cancel_at.elapsed());
 
     assert!(
         message.contains("取消"),
