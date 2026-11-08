@@ -89,3 +89,59 @@ fn cancelling_a_running_compression_stops_the_engine() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// The extraction path uses the same per-call callback as compression. A
+/// 1 GiB sparse zero file compresses to a tiny archive but keeps 7-Zip busy
+/// writing output long enough to cancel mid-run.
+#[test]
+fn cancelling_a_running_extraction_stops_the_engine() {
+    let dir = std::env::temp_dir().join(format!("lambda-cancel-extract-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("zeros.bin");
+    let file = fs::File::create(&input).unwrap();
+    file.set_len(1024 * 1024 * 1024).unwrap();
+    drop(file);
+
+    let archive = dir.join("zeros.7z");
+    let prepared = sevenzip_src::create_with_progress(
+        &archive,
+        &[input],
+        None,
+        "7z",
+        Some(1),
+        Arc::new(AtomicI64::new(-1)),
+        None,
+    );
+    assert!(prepared.is_ok(), "fixture create failed: {prepared:?}");
+
+    let out = dir.join("out");
+    let cancel = Arc::new(AtomicBool::new(false));
+    let flag = cancel.clone();
+    let handle = std::thread::spawn(move || {
+        sevenzip_src::extract_selected_with_progress(
+            &archive,
+            None,
+            &out,
+            &[],
+            Arc::new(AtomicI64::new(-1)),
+            Some(&flag),
+        )
+    });
+
+    std::thread::sleep(Duration::from_millis(150));
+    let cancel_at = Instant::now();
+    cancel.store(true, Ordering::Release);
+    let message = handle.join().unwrap().unwrap_err().0;
+
+    assert!(
+        message.contains("取消"),
+        "cancelled extraction reported {message}"
+    );
+    assert!(
+        cancel_at.elapsed() < Duration::from_secs(5),
+        "extraction cancel took {:?}",
+        cancel_at.elapsed()
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
