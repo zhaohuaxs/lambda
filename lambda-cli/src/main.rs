@@ -5,6 +5,7 @@
 //! small separate binary provides the product's own command syntax and copy.
 //! Both this binary and the Bern UI call the very same vendored 7-Zip engine.
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -13,7 +14,7 @@ use zeroize::Zeroize;
 const USAGE: &str = "\
 用法：
   lambda extract -p <密码> <归档.7z> [-o <输出目录>]
-  lambda extract -p <归档.7z> [-o <输出目录>]   （从 stdin 读密码）
+  lambda extract <归档.7z> -p [-o <输出目录>]   （-p 单独出现时从 stdin 读密码）
   lambda info
 
 选项：
@@ -50,13 +51,15 @@ fn parse(args: &[String]) -> Result<Options, String> {
         let a = &args[i];
         match a.as_str() {
             "-h" | "--help" => o.help = true,
-            "-p" | "--password" => {
-                i += 1;
-                match args.get(i) {
-                    Some(value) => o.password = Some(value.clone()),
-                    None => o.password_stdin = true,
+            "-p" | "--password" => match args.get(i + 1) {
+                Some(value) if !value.starts_with('-') => {
+                    o.password = Some(value.clone());
+                    i += 1;
                 }
-            }
+                // A bare -p means stdin; do not swallow the next option or
+                // the archive path as if it were the password.
+                _ => o.password_stdin = true,
+            },
             "-o" | "--output" => {
                 i += 1;
                 o.output = Some(PathBuf::from(
@@ -106,14 +109,19 @@ fn run() -> Result<(), String> {
         println!("{USAGE}");
         return Ok(());
     }
-    if o.password_stdin {
-        o.password = Some(read_stdin_password()?);
-    }
+    // The environment wins over an interactive prompt: scripts that set
+    // LAMBDA_PASSWORD must never block waiting on stdin.
     if o.password.is_none()
         && let Ok(value) = std::env::var("LAMBDA_PASSWORD")
         && !value.is_empty()
     {
         o.password = Some(value);
+    }
+    if o.password.is_none() && o.password_stdin {
+        if !std::io::stdin().is_terminal() {
+            return Err("需要密码但 stdin 不是终端：用 -p<密码> 或 LAMBDA_PASSWORD".into());
+        }
+        o.password = Some(read_stdin_password()?);
     }
 
     match o.command.as_str() {
@@ -127,7 +135,8 @@ fn run() -> Result<(), String> {
             let password = o.password.as_deref();
 
             println!("[lambda] 正在解除拉姆达的封印...");
-            let report = sevenzip_src::extract(&archive, password, &dest).map_err(|e| e.0)?;
+            let report =
+                sevenzip_src::extract_guarded(&archive, password, &dest).map_err(|e| e.0)?;
             println!("[lambda] 成功释放 {} 个文件。", report.files);
             println!("[lambda] 输出目录：{}", dest.display());
             println!(

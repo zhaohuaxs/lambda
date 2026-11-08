@@ -14,3 +14,6 @@ cc = "1.2"
 chardet_rs = { package = "chardet-rs", version = "=0.1.0" }
 chardetng = "1.0"
 encoding_rs = "0.8"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

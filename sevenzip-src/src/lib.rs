@@ -29,6 +29,18 @@ pub const MAX_LIST_ENTRIES: usize = 200_000;
 /// tiny entries produces a log far larger than the entries themselves.
 const MAX_LIST_LOG_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Refuse only declarations that cannot be real for the archive's own size.
+/// A 16 MiB all-zero file compresses to a few KiB (thousands of times), so a
+/// tight ratio rejects legitimate images and sparse files; the free-space
+/// checks and `SpaceGuard` are the actual protection.
+const ABSURD_RATIO: u64 = 1_000_000;
+
+/// Keep this much space free on the destination volume. On small volumes the
+/// reserve shrinks to a quarter of the free space (see `usable_space`).
+pub const FREE_SPACE_RESERVE: u64 = 256 * 1024 * 1024;
+
+const SPACE_POLL: Duration = Duration::from_millis(250);
+
 /// Engine logs live in a private directory, never next to the user's archive.
 /// `lambda-core` points this at its own cache before the first engine call;
 /// the CLI and host tests fall back to the system temp directory.
@@ -452,6 +464,15 @@ pub fn create_args(
 
 /// Extract `archive` into `out_dir`, which is created when missing.
 pub fn extract(archive: &Path, password: Option<&str>, out_dir: &Path) -> Result<Report, Error> {
+    extract_with_cancel(archive, password, out_dir, None)
+}
+
+fn extract_with_cancel(
+    archive: &Path,
+    password: Option<&str>,
+    out_dir: &Path,
+    cancel: Option<&AtomicBool>,
+) -> Result<Report, Error> {
     if !archive.is_file() {
         return Err(Error(format!("归档不存在：{}", archive.display())));
     }
@@ -460,7 +481,7 @@ pub fn extract(archive: &Path, password: Option<&str>, out_dir: &Path) -> Result
     let outcome = run(
         &with_codepage(archive, extract_args(archive, password, out_dir)),
         &log,
-        None,
+        cancel,
     );
     remove_log(&log);
     let output = outcome?;
@@ -470,6 +491,221 @@ pub fn extract(archive: &Path, password: Option<&str>, out_dir: &Path) -> Result
         bytes,
         log: output,
     })
+}
+
+/// Extract the whole archive after applying the same limits the UI uses.
+/// This is the CLI's entry point: before it existed, the UI had gates but
+/// `lambda extract` called the engine directly and accepted any bomb.
+pub fn extract_guarded(
+    archive: &Path,
+    password: Option<&str>,
+    out_dir: &Path,
+) -> Result<Report, Error> {
+    preflight_extract(archive, password, out_dir)?;
+    fs::create_dir_all(out_dir)?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let guard = SpaceGuard::start(out_dir, cancel.clone());
+    let outcome = extract_with_cancel(archive, password, out_dir, Some(&cancel));
+    let exceeded = guard.exceeded();
+    drop(guard);
+    if exceeded {
+        return Err(Error(
+            "空间不足：解压过程中可用空间低于安全余量，已停止".into(),
+        ));
+    }
+    outcome
+}
+
+/// List the archive once and check its declared output before the CLI writes
+/// anything. Errors are the same strings the UI gate produces.
+pub fn preflight_extract(
+    archive: &Path,
+    password: Option<&str>,
+    out_dir: &Path,
+) -> Result<(), Error> {
+    let entries = list(archive, password)?;
+    let entry_count = entries.iter().filter(|entry| !entry.folder).count();
+    let declared_bytes = entries
+        .iter()
+        .filter(|entry| !entry.folder)
+        .fold(0u64, |sum, entry| sum.saturating_add(entry.size));
+    check_extract_limits(archive, declared_bytes, entry_count, &[out_dir])
+}
+
+/// The extraction gate shared by the UI and the CLI.
+///
+/// `declared_bytes` comes from the archive listing. It is only a sanity check:
+/// a crafted header can under-report, which is why the caller also starts a
+/// `SpaceGuard` for the duration of the write.
+pub fn check_extract_limits(
+    archive: &Path,
+    declared_bytes: u64,
+    entry_count: usize,
+    targets: &[&Path],
+) -> Result<(), Error> {
+    if entry_count > MAX_LIST_ENTRIES {
+        return Err(Error(format!(
+            "归档条目超过 {MAX_LIST_ENTRIES} 项，暂不解压"
+        )));
+    }
+    let archive_bytes = fs::metadata(archive)
+        .map_err(|error| Error(format!("无法读取归档大小：{error}")))?
+        .len();
+    let budget = archive_bytes
+        .saturating_mul(ABSURD_RATIO)
+        .saturating_add(FREE_SPACE_RESERVE);
+    if declared_bytes > budget {
+        return Err(Error(format!(
+            "疑似解压炸弹：条目声明 {} 字节，归档只有 {} 字节",
+            bytes_text(declared_bytes),
+            bytes_text(archive_bytes)
+        )));
+    }
+    for target in targets {
+        if let Some(free) = free_space(target) {
+            let usable = usable_space(free);
+            if declared_bytes > usable {
+                return Err(Error(format!(
+                    "空间不足：需要 {}，可用 {}",
+                    bytes_text(declared_bytes),
+                    bytes_text(usable)
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn usable_space(free: u64) -> u64 {
+    free.saturating_sub(FREE_SPACE_RESERVE.min(free / 4))
+}
+
+fn guard_floor(free: u64) -> u64 {
+    FREE_SPACE_RESERVE.min(free / 4).max(1)
+}
+
+fn bytes_text(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if value >= 100.0 {
+        format!("{value:.0} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// Free bytes available for a new file in `path`'s volume. The path may not
+/// exist yet: the nearest existing directory decides the volume.
+pub fn free_space(path: &Path) -> Option<u64> {
+    let path = volume_dir(path)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut free = 0u64;
+        let ok = unsafe {
+            GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &mut free,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        (ok != 0).then_some(free)
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        let ok = unsafe { libc::statvfs(path.as_ptr(), &mut stat) };
+        (ok == 0).then(|| stat.f_bavail as u64 * stat.f_frsize as u64)
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+fn volume_dir(path: &Path) -> Option<&Path> {
+    let mut current = path;
+    loop {
+        if current.is_dir() {
+            return Some(current);
+        }
+        current = current.parent()?;
+    }
+}
+
+/// Watches free space while extraction writes. 7-Zip only exposes a
+/// percentage, so this aborts when the volume falls below the reserve instead
+/// of trusting the sizes declared in the archive headers.
+pub struct SpaceGuard {
+    stop: Arc<AtomicBool>,
+    exceeded: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SpaceGuard {
+    pub fn start(dir: &Path, cancel: Arc<AtomicBool>) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let exceeded = Arc::new(AtomicBool::new(false));
+        let stop_flag = stop.clone();
+        let exceeded_flag = exceeded.clone();
+        let dir = dir.to_path_buf();
+        // Abort only when the volume falls below the reserve, not when it
+        // falls below `free_at_start - reserve`: the gate above already
+        // approved the declared size, and that size may use most of the
+        // space above the reserve.
+        let floor = free_space(&dir).map(guard_floor);
+        let handle = std::thread::spawn(move || {
+            let Some(floor) = floor else {
+                return;
+            };
+            while !stop_flag.load(Ordering::Relaxed) {
+                if cancel.load(Ordering::Acquire) {
+                    break;
+                }
+                if free_space(&dir).is_some_and(|free| free < floor) {
+                    exceeded_flag.store(true, Ordering::Release);
+                    cancel.store(true, Ordering::Release);
+                    break;
+                }
+                std::thread::sleep(SPACE_POLL);
+            }
+        });
+        Self {
+            stop,
+            exceeded,
+            handle: Some(handle),
+        }
+    }
+
+    pub fn exceeded(&self) -> bool {
+        self.exceeded.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for SpaceGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 /// Extract the whole archive, or only `paths`, reporting progress into
@@ -799,6 +1035,12 @@ pub fn enable_utf8_console() {
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn SetConsoleOutputCP(codepage: u32) -> i32;
+    fn GetDiskFreeSpaceExW(
+        directory_name: *const u16,
+        free_bytes_available_to_caller: *mut u64,
+        total_number_of_bytes: *mut u64,
+        total_number_of_free_bytes: *mut u64,
+    ) -> i32;
 }
 
 #[cfg(any(target_os = "android", windows))]
@@ -854,8 +1096,9 @@ fn run(args: &[String], log: &Path, cancel: Option<&AtomicBool>) -> Result<Strin
         Ok(text)
     } else {
         // 直接把整段日志丢给用户会看到版本横幅与版权声明；只留原因那一行。
+        let cancelled = cancel.is_some_and(|flag| flag.load(Ordering::Acquire));
         Err(Error(
-            failure_message_ctx(&text, had_password)
+            failure_message_ctx(&text, had_password, cancelled)
                 .unwrap_or_else(|| format!("7-Zip 退出码 {code}")),
         ))
     }
@@ -921,7 +1164,12 @@ where
         .trim()
         .to_string();
     Err(Error(
-        failure_message_ctx(&text, had_password).unwrap_or_else(|| format!("7-Zip 退出码 {code}")),
+        failure_message_ctx(
+            &text,
+            had_password,
+            cancel.is_some_and(|flag| flag.load(Ordering::Acquire)),
+        )
+        .unwrap_or_else(|| format!("7-Zip 退出码 {code}")),
     ))
 }
 
@@ -945,10 +1193,17 @@ where
 /// `Break signaled`, which is what 7-Zip says after it asked for a password on
 /// a console that has none.
 pub fn failure_message(output: &str) -> Option<String> {
-    failure_message_ctx(output, false)
+    failure_message_ctx(output, false, false)
 }
 
-fn failure_message_ctx(output: &str, had_password: bool) -> Option<String> {
+fn failure_message_ctx(output: &str, had_password: bool, cancelled: bool) -> Option<String> {
+    if cancelled {
+        // A user (or the space guard) stopped the engine. This must win over
+        // the password classification: `Break signaled` with no `-p` is
+        // otherwise indistinguishable from an encrypted archive waiting for
+        // a password.
+        return Some("已取消：引擎已停止".into());
+    }
     let lines: Vec<&str> = output
         .lines()
         .map(str::trim)
@@ -1002,28 +1257,38 @@ fn failure_message_ctx(output: &str, had_password: bool) -> Option<String> {
 fn redact_private_paths(text: &str) -> String {
     let mut out = text.to_string();
     for marker in ["/data/", "content://"] {
-        if let Some(start) = out.find(marker) {
-            let end = out[start..]
-                .find(char::is_whitespace)
-                .map(|offset| start + offset)
-                .unwrap_or(out.len());
+        let mut from = 0;
+        while let Some(offset) = out[from..].find(marker) {
+            let start = from + offset;
+            let end = path_token_end(&out, start);
             out.replace_range(start..end, "<path>");
+            from = start + "<path>".len();
         }
     }
-    if let Some(colon) = out.find(":\\") {
-        let start = out[..colon]
-            .rfind(char::is_whitespace)
-            .map(|index| index + 1)
-            .unwrap_or(0);
-        let end = out[colon..]
-            .find(char::is_whitespace)
-            .map(|offset| colon + offset)
-            .unwrap_or(out.len());
-        if start < end {
-            out.replace_range(start..end, "<path>");
-        }
+    let mut from = 0;
+    while let Some(offset) = out[from..].find(":\\") {
+        let colon = from + offset;
+        let start = colon.saturating_sub(1);
+        let end = path_token_end(&out, start);
+        out.replace_range(start..end, "<path>");
+        from = start + "<path>".len();
     }
     out
+}
+
+/// A path token ends at 7-Zip's ` : reason` separator or at punctuation.
+/// Drive paths may contain spaces (`C:\Program Files\…`), so whitespace alone
+/// is not enough; Chinese punctuation is included so a prefix such as
+/// `无法打开` is preserved.
+fn path_token_end(text: &str, start: usize) -> usize {
+    let rest = &text[start..];
+    if let Some(offset) = rest.find(" : ") {
+        return start + offset;
+    }
+    rest.find(|c: char| {
+        c.is_whitespace() || matches!(c, '：' | '，' | '。' | '；' | '）' | '」' | '"' | '\'')
+    })
+    .map_or(text.len(), |offset| start + offset)
 }
 
 #[cfg(test)]
@@ -1219,13 +1484,21 @@ mod tests {
     }
 
     #[test]
-    fn a_cancel_after_a_password_is_not_reported_as_a_missing_password() {
+    fn a_cancelled_engine_break_is_not_reported_as_a_password_problem() {
         assert_eq!(
-            failure_message_ctx("Break signaled", true).as_deref(),
+            failure_message_ctx("Break signaled", false, true).as_deref(),
             Some("已取消：引擎已停止")
         );
         assert_eq!(
-            failure_message_ctx("Break signaled", false).as_deref(),
+            failure_message_ctx("Break signaled", true, true).as_deref(),
+            Some("已取消：引擎已停止")
+        );
+        assert_eq!(
+            failure_message_ctx("Break signaled", true, false).as_deref(),
+            Some("已取消：引擎已停止")
+        );
+        assert_eq!(
+            failure_message_ctx("Break signaled", false, false).as_deref(),
             Some("需要密码：这个归档已加密")
         );
     }
@@ -1236,6 +1509,66 @@ mod tests {
             failure_message("ERROR: Can not open /data/user/0/dev.bern.lambda/cache/x.7z").unwrap();
         assert!(!message.contains("/data/"));
         assert!(message.contains("<path>"));
+    }
+
+    #[test]
+    fn every_private_path_is_redacted() {
+        let message = failure_message("ERROR: /data/a.7z and /data/b.7z failed").unwrap();
+        assert_eq!(message.matches("<path>").count(), 2);
+        assert!(!message.contains("/data/"));
+    }
+
+    #[test]
+    fn a_windows_path_with_spaces_is_redacted_whole() {
+        let text = r"cannot open C:\Program Files\Lambda\a.7z : Headers Error";
+        assert_eq!(
+            redact_private_paths(text),
+            "cannot open <path> : Headers Error"
+        );
+    }
+
+    #[test]
+    fn a_prefix_before_a_drive_letter_is_preserved() {
+        assert_eq!(
+            redact_private_paths(r"无法打开C:\tmp\a.7z"),
+            "无法打开<path>"
+        );
+    }
+
+    #[test]
+    fn extraction_limits_allow_high_compression_but_reject_absurd_sizes() {
+        let dir = std::env::temp_dir().join(format!("lambda-limits-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let archive = dir.join("small.7z");
+        fs::write(&archive, vec![0u8; 1024]).unwrap();
+
+        // 6 MB from 1 KB is ~6000x: the old 1000x gate rejected this shape.
+        check_extract_limits(&archive, 6 * 1024 * 1024, 1, &[&dir]).unwrap();
+        assert!(
+            check_extract_limits(&archive, 2 * 1024 * 1024 * 1024 * 1024, 1, &[]).is_err(),
+            "2 TB from 1 KB must be refused"
+        );
+        assert!(
+            check_extract_limits(&dir.join("missing.7z"), 0, 0, &[]).is_err(),
+            "unreadable archive metadata must be an error"
+        );
+        assert!(
+            check_extract_limits(&archive, 0, MAX_LIST_ENTRIES + 1, &[]).is_err(),
+            "too many entries must be refused"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reserve_scales_down_on_small_volumes() {
+        assert_eq!(
+            usable_space(1024 * 1024 * 1024),
+            1024 * 1024 * 1024 - FREE_SPACE_RESERVE
+        );
+        assert_eq!(usable_space(100 * 1024 * 1024), 75 * 1024 * 1024);
+        assert_eq!(guard_floor(1024 * 1024 * 1024), FREE_SPACE_RESERVE);
+        assert_eq!(guard_floor(100 * 1024 * 1024), 25 * 1024 * 1024);
     }
 
     #[test]

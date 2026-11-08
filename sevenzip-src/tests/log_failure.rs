@@ -1,3 +1,5 @@
+#![cfg(any(windows, target_os = "android"))]
+
 use std::fs;
 
 use sevenzip_src::{list, set_log_dir};

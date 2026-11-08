@@ -1299,14 +1299,14 @@ impl LambdaEngine {
             && let Err(error) = std::fs::remove_dir_all(dir)
             && error.kind() != std::io::ErrorKind::NotFound
         {
-            self.state.status = format!("无法清理临时目录 {}：{error}", dir.display());
+            self.state.status = format!("无法清理临时目录：{error}");
         }
         if let Some(pending) = self.pending.take()
             && let Some(dir) = pending.owned
             && let Err(error) = std::fs::remove_dir_all(&dir)
             && error.kind() != std::io::ErrorKind::NotFound
         {
-            self.state.status = format!("无法清理临时目录 {}：{error}", dir.display());
+            self.state.status = format!("无法清理临时目录：{error}");
         }
     }
 
@@ -2121,8 +2121,13 @@ impl LambdaEngine {
         let Some(shared) = self.job.clone() else {
             return;
         };
-        let snapshot = match shared.lock() {
-            Ok(job) => (
+        let snapshot = {
+            // Recover a poisoned mutex: a panic in one worker must not leave
+            // the UI permanently busy or strand files handed to the app.
+            let job = shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (
                 job.title.clone(),
                 job.phase.clone(),
                 job.label.clone(),
@@ -2131,8 +2136,7 @@ impl LambdaEngine {
                 job.percent(),
                 job.percent_text(),
                 job.outcome.clone(),
-            ),
-            Err(_) => return,
+            )
         };
         let (title, phase, label, done, total, percent, percent_text, outcome) = snapshot;
         self.state.job_active = true;

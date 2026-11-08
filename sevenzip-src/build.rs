@@ -114,17 +114,31 @@ fn stage_notices() {
             "unRarLicense.txt",
         ),
     ];
-    let targets = [
-        workspace.join("target/bern/android/project/app/src/main/assets/notices"),
-        workspace.join("target/bern/windows/app/runtime/notices"),
-    ];
+    let targets = match env::var("CARGO_CFG_TARGET_OS").as_deref() {
+        Ok("android") => {
+            vec![workspace.join("target/bern/android/project/app/src/main/assets/notices")]
+        }
+        Ok("windows") => vec![workspace.join("target/bern/windows/app/runtime/notices")],
+        _ => return,
+    };
     for dir in targets {
-        if fs::create_dir_all(&dir).is_err() {
+        if let Err(error) = fs::create_dir_all(&dir) {
+            println!(
+                "cargo:warning=无法创建第三方声明目录 {}：{error}",
+                dir.display()
+            );
             continue;
         }
-        let _ = fs::copy(&notice, dir.join("THIRD-PARTY-NOTICES.md"));
+        if let Err(error) = fs::copy(&notice, dir.join("THIRD-PARTY-NOTICES.md")) {
+            println!(
+                "cargo:warning=无法复制第三方声明 {}：{error}",
+                notice.display()
+            );
+        }
         for (source, name) in &licenses {
-            let _ = fs::copy(source, dir.join(name));
+            if let Err(error) = fs::copy(source, dir.join(name)) {
+                println!("cargo:warning=无法复制 {}：{error}", source.display());
+            }
         }
     }
 }
@@ -357,7 +371,10 @@ fn build_windows() {
         .unwrap_or_else(|error| panic!("cannot run the librarian: {error}"));
     assert!(status.success(), "lib.exe failed: {status}");
     println!("cargo:rustc-link-search=native={}", out.display());
-    println!("cargo:rustc-link-lib=static=lambda7z");
+    // `+whole-archive` is required: MSVC pulls only objects that satisfy a
+    // reference, and the format handlers register themselves from static
+    // constructors, so a plain static lib would link but find no formats.
+    println!("cargo:rustc-link-lib=static:+whole-archive=lambda7z");
     // System libraries the console front-end needs (same five as the
     // upstream MSVC build). Bern's hard-coded app link already lists them.
     for library in ["oleaut32", "ole32", "user32", "advapi32", "shell32"] {

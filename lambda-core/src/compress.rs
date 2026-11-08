@@ -59,9 +59,8 @@ pub struct Input {
 pub fn start(job: Shared, waker: Waker, inputs: Vec<Input>, plan: Plan) {
     std::thread::spawn(move || {
         let outcome = run(&job, &waker, inputs, plan);
-        if let Ok(mut guard) = job.lock() {
-            guard.outcome = Some(outcome);
-        }
+        let mut guard = job.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.outcome = Some(outcome);
         waker.wake();
     });
 }

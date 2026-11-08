@@ -127,8 +127,10 @@ pub struct Report {
     pub engine: String,
 }
 
-/// One item of an archive listing. `path` keeps the engine's separator; the
-/// archive layer normalises it before showing anything.
+/// One item of an archive listing. `path` is normalized to `/` here: the
+/// engine may hand back `a\b.txt`, while selection and gate comparisons use
+/// the archive layer's key. Invalid paths (absolute, `..`) stay raw and are
+/// dropped by the browser.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListedEntry {
     pub path: String,
@@ -136,6 +138,10 @@ pub struct ListedEntry {
     pub folder: bool,
     pub encrypted: bool,
     pub link: bool,
+}
+
+fn entry_path(raw: &str) -> String {
+    crate::archive::normalize(raw).unwrap_or_else(|| raw.to_string())
 }
 
 /// Copy the document at `url` into `dir` under its own name, keeping any file
@@ -436,7 +442,7 @@ pub fn list_entries(archive: &Path, password: Option<&str>) -> Result<Vec<Listed
                 entries
                     .into_iter()
                     .map(|entry| ListedEntry {
-                        path: entry.path,
+                        path: entry_path(&entry.path),
                         size: entry.size,
                         folder: entry.folder,
                         encrypted: entry.encrypted,
@@ -510,53 +516,6 @@ pub fn extract_entries(
     }
 }
 
-/// Free bytes available to the app for `path`'s volume, when the platform can
-/// tell us. Used as the last extraction gate before a bomb fills the disk.
-pub fn free_space(path: &Path) -> Option<u64> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        let wide: Vec<u16> = path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let mut free = 0u64;
-        let ok = unsafe {
-            GetDiskFreeSpaceExW(
-                wide.as_ptr(),
-                &mut free,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        (ok != 0).then_some(free)
-    }
-    #[cfg(target_os = "android")]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
-        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-        let ok = unsafe { libc::statvfs(path.as_ptr(), &mut stat) };
-        (ok == 0).then(|| stat.f_bavail as u64 * stat.f_frsize as u64)
-    }
-    #[cfg(not(any(windows, target_os = "android")))]
-    {
-        let _ = path;
-        None
-    }
-}
-
-#[cfg(windows)]
-unsafe extern "system" {
-    fn GetDiskFreeSpaceExW(
-        directory_name: *const u16,
-        free_bytes_available_to_caller: *mut u64,
-        total_number_of_bytes: *mut u64,
-        total_number_of_free_bytes: *mut u64,
-    ) -> i32;
-}
-
 /// Create a zip at `archive` from local inputs.
 pub fn create_zip(archive: &Path, inputs: &[PathBuf], password: Option<&str>) -> Result<Report> {
     #[cfg(any(windows, target_os = "android"))]
@@ -598,5 +557,12 @@ mod tests {
         assert!(path.to_string_lossy().ends_with("backup.7z"));
         assert!(!path.to_string_lossy().ends_with("backup.7z.7z"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn listed_paths_are_normalized_before_comparisons() {
+        assert_eq!(entry_path("a\\b.txt"), "a/b.txt");
+        assert_eq!(entry_path("./a//b.txt"), "a/b.txt");
+        assert_eq!(entry_path("../evil"), "../evil");
     }
 }

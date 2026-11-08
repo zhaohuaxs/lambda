@@ -23,14 +23,6 @@ use crate::job::{Job, Outcome, Shared, Ticker};
 
 const WAKE_INTERVAL: Duration = Duration::from_millis(150);
 
-/// Refuse archives whose declared output is absurd before the engine writes
-/// anything. 7-Zip reports every entry's size in the listing Lambda already
-/// holds, so this costs nothing.
-const MAX_ENTRY_COUNT: usize = 200_000;
-const BOMB_RATIO: u64 = 1_000;
-const BOMB_SLACK: u64 = 64 * 1024 * 1024;
-const FREE_SPACE_RESERVE: u64 = 256 * 1024 * 1024;
-
 /// 当前层里被选中的一项。`path` 是归档内的完整路径。
 pub struct Output {
     pub path: String,
@@ -69,9 +61,8 @@ impl Drop for Plan {
 pub fn start(job: Shared, waker: Waker, plan: Plan) {
     std::thread::spawn(move || {
         let outcome = run(&job, &waker, plan);
-        if let Ok(mut guard) = job.lock() {
-            guard.outcome = Some(outcome);
-        }
+        let mut guard = job.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.outcome = Some(outcome);
         waker.wake();
     });
 }
@@ -96,34 +87,20 @@ fn run(job: &Shared, waker: &Waker, plan: Plan) -> Outcome {
 }
 
 fn gate(plan: &Plan, staging: &Path) -> Result<(), Failure> {
-    if plan.entry_count > MAX_ENTRY_COUNT {
-        return Err(Failure::Message(format!(
-            "归档条目超过 {MAX_ENTRY_COUNT} 项，暂不解压"
-        )));
+    let target = bern::files::file_path(&plan.root);
+    let mut targets = vec![staging];
+    if let Some(target) = target.as_deref() {
+        // Staging is on the private cache volume; export lands on the
+        // user-selected volume, which may be a different disk/card.
+        targets.push(target);
     }
-    let archive_bytes = fs::metadata(&plan.archive)
-        .map(|meta| meta.len())
-        .unwrap_or(0);
-    let budget = archive_bytes
-        .saturating_mul(BOMB_RATIO)
-        .saturating_add(BOMB_SLACK);
-    if plan.declared_bytes > budget {
-        return Err(Failure::Message(format!(
-            "疑似解压炸弹：条目声明 {} 字节，归档只有 {} 字节",
-            crate::browser::size_text(plan.declared_bytes),
-            crate::browser::size_text(archive_bytes)
-        )));
-    }
-    if let Some(free) = backend::free_space(staging)
-        && plan.declared_bytes > free.saturating_sub(FREE_SPACE_RESERVE)
-    {
-        return Err(Failure::Message(format!(
-            "空间不足：需要 {}，可用 {}",
-            crate::browser::size_text(plan.declared_bytes),
-            crate::browser::size_text(free)
-        )));
-    }
-    Ok(())
+    sevenzip_src::check_extract_limits(
+        &plan.archive,
+        plan.declared_bytes,
+        plan.entry_count,
+        &targets,
+    )
+    .map_err(|error| Failure::Message(error.0))
 }
 
 enum Failure {
@@ -149,15 +126,28 @@ fn extract(job: &Shared, waker: &Waker, plan: &Plan, out: &Path) -> Result<u64, 
     // Windows 会真的杀掉子进程，这里的取消标志两种平台都传下去。
     let _ticker = Ticker::start(waker.clone(), WAKE_INTERVAL);
     let password = (!plan.password.is_empty()).then_some(plan.password.as_str());
-    let bytes = backend::extract_entries(&plan.archive, password, out, &plan.paths, slot, cancel)
-        .map_err(|message| {
-        if message == "已取消" {
-            Failure::Cancelled
-        } else {
-            Failure::Message(message)
+    let space = sevenzip_src::SpaceGuard::start(out, cancel.clone());
+    let outcome = backend::extract_entries(&plan.archive, password, out, &plan.paths, slot, cancel);
+    let bytes = match outcome {
+        Ok(bytes) => bytes,
+        Err(message) => {
+            // The guard sets the same cancel flag the user does; check it
+            // before translating the engine's generic "已取消".
+            if space.exceeded() {
+                return Err(Failure::Message(
+                    "空间不足：解压过程中可用空间低于安全余量，已停止".into(),
+                ));
+            }
+            return Err(if message == "已取消" {
+                Failure::Cancelled
+            } else {
+                Failure::Message(message)
+            });
         }
-    })?;
-    if job.lock().map(|guard| guard.cancelled()).unwrap_or(false) {
+    };
+    let space_exceeded = space.exceeded();
+    drop(space);
+    if !space_exceeded && job.lock().map(|guard| guard.cancelled()).unwrap_or(false) {
         return Err(Failure::Cancelled);
     }
     Ok(bytes)
@@ -341,7 +331,7 @@ mod tests {
         let dir = temp("count");
         let archive = dir.join("a.7z");
         fs::write(&archive, b"x").unwrap();
-        let plan = plan(&archive, 0, MAX_ENTRY_COUNT + 1);
+        let plan = plan(&archive, 0, sevenzip_src::MAX_LIST_ENTRIES + 1);
         assert!(matches!(gate(&plan, &dir), Err(Failure::Message(_))));
         let _ = fs::remove_dir_all(&dir);
     }
@@ -351,7 +341,7 @@ mod tests {
         let dir = temp("bomb");
         let archive = dir.join("a.7z");
         fs::write(&archive, vec![0u8; 1024]).unwrap();
-        let plan = plan(&archive, 1024 * 1024 * 1024, 1);
+        let plan = plan(&archive, 64 * 1024 * 1024 * 1024, 1);
         assert!(matches!(gate(&plan, &dir), Err(Failure::Message(_))));
         let _ = fs::remove_dir_all(&dir);
     }

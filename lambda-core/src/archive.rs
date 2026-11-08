@@ -63,10 +63,7 @@ pub fn is_encrypted(entries: &[ListedEntry]) -> bool {
 /// 错误消息是不是「缺密码 / 密码不对」。
 pub fn password_error(message: &str) -> bool {
     let lower = message.to_lowercase();
-    lower.contains("password")
-        || message.contains("密码")
-        || lower.contains("encrypted")
-        || lower.contains("break signaled")
+    lower.contains("password") || message.contains("密码") || lower.contains("encrypted")
 }
 
 /// 当前层的直接子项。`prefix` 形如 `""` 或 `"sub/"`。
@@ -336,5 +333,6 @@ mod tests {
         // a password would send the user down the wrong path.
         assert!(!password_error("Headers Error"));
         assert!(!password_error("Cannot open the file as [7z] archive"));
+        assert!(!password_error("Break signaled"));
     }
 }

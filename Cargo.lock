@@ -866,7 +866,6 @@ dependencies = [
  "chardet-rs",
  "encoding_rs",
  "lambda-protocol",
- "libc",
  "serde_json",
  "sevenzip-src",
  "zeroize",
@@ -1402,6 +1401,7 @@ dependencies = [
  "chardet-rs",
  "chardetng",
  "encoding_rs",
+ "libc",
 ]
 
 [[package]]

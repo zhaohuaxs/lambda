@@ -1,3 +1,5 @@
+#![cfg(any(windows, target_os = "android"))]
+
 use std::fs;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64};
@@ -28,7 +30,11 @@ fn a_cancelled_compression_does_not_run_to_completion() {
     );
     let elapsed = started.elapsed();
 
-    assert!(result.is_err(), "cancelled compression reported success");
+    let message = result.unwrap_err().0;
+    assert!(
+        message.contains("取消"),
+        "cancelled compression reported {message}"
+    );
     assert!(
         elapsed < Duration::from_secs(10),
         "cancel took {elapsed:?}; the engine probably ignored the flag"
