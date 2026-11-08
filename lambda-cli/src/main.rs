@@ -137,6 +137,9 @@ fn run() -> Result<(), String> {
             println!("[lambda] 正在解除拉姆达的封印...");
             let report =
                 sevenzip_src::extract_guarded(&archive, password, &dest).map_err(|e| e.0)?;
+            if let Some(warning) = &report.warning {
+                eprintln!("[lambda] 警告：{warning}");
+            }
             println!("[lambda] 成功释放 {} 个文件。", report.files);
             println!("[lambda] 输出目录：{}", dest.display());
             println!(

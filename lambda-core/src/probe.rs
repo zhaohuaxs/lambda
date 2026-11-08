@@ -571,7 +571,7 @@ mod android {
         ] {
             let target = f.out.join(format!("ok-{}", stem(label)));
             let started = Instant::now();
-            match engine::extract(archive, password, &target) {
+            match engine::extract_unchecked(archive, password, &target) {
                 Ok(report) => {
                     let names = names_under(&target);
                     let unicode = names.iter().any(|n| n.contains("中文 名字.txt"))
@@ -599,7 +599,7 @@ mod android {
         let overwrite = f.out.join("overwrite");
         let _ = fs::create_dir_all(&overwrite);
         let _ = write(&overwrite.join("a.txt"), b"stale content\n");
-        let ok = engine::extract(&f.plain_7z, None, &overwrite)
+        let ok = engine::extract_unchecked(&f.plain_7z, None, &overwrite)
             .map(|_| {
                 fs::read_to_string(overwrite.join("a.txt")).unwrap_or_default()
                     == "hello from lambda\n"
@@ -618,7 +618,7 @@ mod android {
 
         let deep_target = f.out.join("deep");
         let started = Instant::now();
-        match engine::extract(&f.deep_7z, None, &deep_target) {
+        match engine::extract_unchecked(&f.deep_7z, None, &deep_target) {
             Ok(report) => {
                 let leaf = names_under(&deep_target)
                     .into_iter()
@@ -648,7 +648,7 @@ mod android {
         ] {
             let target = f.out.join(format!("bad-{}-{}", id, stem(label)));
             let started = Instant::now();
-            match engine::extract(archive, password, &target) {
+            match engine::extract_unchecked(archive, password, &target) {
                 Ok(report) => tally.check(
                     id,
                     label,
@@ -675,7 +675,7 @@ mod android {
         }
 
         let empty_target = f.out.join("empty");
-        match engine::extract(&f.empty_zip, None, &empty_target) {
+        match engine::extract_unchecked(&f.empty_zip, None, &empty_target) {
             Ok(report) => tally.check(
                 "T15",
                 "解压空 zip",
@@ -687,7 +687,7 @@ mod android {
 
         // 目录当归档传：引擎必须拒绝，而不是把目录当文件读。
         let target = f.out.join("as-archive");
-        match engine::extract(&f.src, None, &target) {
+        match engine::extract_unchecked(&f.src, None, &target) {
             Ok(report) => tally.check(
                 "T16",
                 "目录当归档",
@@ -711,7 +711,7 @@ mod android {
         tally.head("安全：路径穿越（Zip Slip / 绝对路径）");
 
         let target = f.out.join("slip");
-        let result = engine::extract(&f.slip_zip, None, &target);
+        let result = engine::extract_unchecked(&f.slip_zip, None, &target);
         let inside = names_under(&target);
         // 目标目录之外是否出现任何东西：上一级是本用例的 `out/`，再上一级是 bench 根。
         let parent = f.out.clone();
@@ -812,7 +812,7 @@ mod android {
 
         let target = root.join("out-many");
         let started = Instant::now();
-        match engine::extract(&archive, None, &target) {
+        match engine::extract_unchecked(&archive, None, &target) {
             Ok(report) => tally.check(
                 "B03",
                 "解压 5000 个文件",
@@ -863,7 +863,7 @@ mod android {
                 );
                 let target = root.join("out-blob");
                 let started = Instant::now();
-                match engine::extract(&blob_archive, None, &target) {
+                match engine::extract_unchecked(&blob_archive, None, &target) {
                     Ok(extracted) => {
                         let ok = extracted.bytes == 32 * 1024 * 1024;
                         tally.check(
@@ -897,7 +897,7 @@ mod android {
                 let ratio = 16.0 * 1024.0 * 1024.0 / report.bytes.max(1) as f64;
                 let target = root.join("out-zeros");
                 let started = Instant::now();
-                let extracted = engine::extract(&zeros_archive, None, &target);
+                let extracted = engine::extract_unchecked(&zeros_archive, None, &target);
                 let extract_ms = started.elapsed().as_millis();
                 let bytes = extracted.map(|r| r.bytes).unwrap_or(0);
                 tally.check(

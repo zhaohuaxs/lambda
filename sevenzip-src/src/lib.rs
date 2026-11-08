@@ -96,6 +96,9 @@ pub struct Report {
     pub bytes: u64,
     /// Tail of 7zr's stdout/stderr, useful for warnings.
     pub log: String,
+    /// Non-fatal problem the caller should surface (for example the space
+    /// guard tripping after the engine had already finished).
+    pub warning: Option<String>,
 }
 
 pub fn engine_name() -> &'static str {
@@ -462,8 +465,14 @@ pub fn create_args(
     args
 }
 
-/// Extract `archive` into `out_dir`, which is created when missing.
-pub fn extract(archive: &Path, password: Option<&str>, out_dir: &Path) -> Result<Report, Error> {
+/// Extract `archive` into `out_dir` without any preflight. Product code must
+/// use [`extract_guarded`]; only the Android probe/bench harness calls this
+/// to exercise hostile archives intentionally.
+pub fn extract_unchecked(
+    archive: &Path,
+    password: Option<&str>,
+    out_dir: &Path,
+) -> Result<Report, Error> {
     extract_with_cancel(archive, password, out_dir, None)
 }
 
@@ -490,6 +499,7 @@ fn extract_with_cancel(
         files,
         bytes,
         log: output,
+        warning: None,
     })
 }
 
@@ -504,14 +514,18 @@ pub fn extract_guarded(
     preflight_extract(archive, password, out_dir)?;
     fs::create_dir_all(out_dir)?;
     let cancel = Arc::new(AtomicBool::new(false));
-    let guard = SpaceGuard::start(out_dir, cancel.clone());
+    let guard = SpaceGuard::start(out_dir, cancel.clone())?;
     let outcome = extract_with_cancel(archive, password, out_dir, Some(&cancel));
-    let exceeded = guard.exceeded();
-    drop(guard);
+    let exceeded = guard.finish();
     match outcome {
-        // The guard may trip just as the engine finishes; a complete output
-        // is not a failure.
-        Ok(report) => Ok(report),
+        // The engine may have completed just before the guard tripped; the
+        // bytes are there, but the caller should still know the volume is low.
+        Ok(mut report) => {
+            if exceeded {
+                report.warning = Some("解压已完成，但可用空间低于安全余量".into());
+            }
+            Ok(report)
+        }
         Err(_) if exceeded => Err(Error(
             "空间不足：解压过程中可用空间低于安全余量，已停止".into(),
         )),
@@ -565,15 +579,14 @@ pub fn check_extract_limits(
         )));
     }
     for target in targets {
-        if let Some(free) = free_space(target) {
-            let usable = usable_space(free);
-            if declared_bytes > usable {
-                return Err(Error(format!(
-                    "空间不足：需要 {}，可用 {}",
-                    bytes_text(declared_bytes),
-                    bytes_text(usable)
-                )));
-            }
+        let free = free_space(target).ok_or_else(|| Error("无法读取目标卷的可用空间".into()))?;
+        let usable = usable_space(free);
+        if declared_bytes > usable {
+            return Err(Error(format!(
+                "空间不足：需要 {}，可用 {}",
+                bytes_text(declared_bytes),
+                bytes_text(usable)
+            )));
         }
     }
     Ok(())
@@ -643,13 +656,19 @@ pub fn free_space(path: &Path) -> Option<u64> {
     }
 }
 
-fn volume_dir(path: &Path) -> Option<&Path> {
-    let mut current = path;
+fn volume_dir(path: &Path) -> Option<PathBuf> {
+    // Relative CLI destinations must resolve against the process cwd, not
+    // fall off the end of `Path::parent`.
+    let mut current = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
     loop {
         if current.is_dir() {
             return Some(current);
         }
-        current = current.parent()?;
+        current = current.parent()?.to_path_buf();
     }
 }
 
@@ -659,55 +678,74 @@ fn volume_dir(path: &Path) -> Option<&Path> {
 pub struct SpaceGuard {
     stop: Arc<AtomicBool>,
     exceeded: Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
+    dir: PathBuf,
+    floor: u64,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl SpaceGuard {
-    pub fn start(dir: &Path, cancel: Arc<AtomicBool>) -> Self {
+    pub fn start(dir: &Path, cancel: Arc<AtomicBool>) -> Result<Self, Error> {
+        let dir = dir.to_path_buf();
+        // Failing closed here matters: a guard that silently cannot read the
+        // volume would disable the only runtime protection.
+        let free = free_space(&dir).ok_or_else(|| Error("无法读取目标卷的可用空间".into()))?;
+        let floor = guard_floor(free);
         let stop = Arc::new(AtomicBool::new(false));
         let exceeded = Arc::new(AtomicBool::new(false));
         let stop_flag = stop.clone();
         let exceeded_flag = exceeded.clone();
-        let dir = dir.to_path_buf();
-        // Abort only when the volume falls below the reserve, not when it
-        // falls below `free_at_start - reserve`: the gate above already
-        // approved the declared size, and that size may use most of the
-        // space above the reserve.
-        let floor = free_space(&dir).map(guard_floor);
+        let cancel_thread = cancel.clone();
+        let dir_thread = dir.clone();
         let handle = std::thread::spawn(move || {
-            let Some(floor) = floor else {
-                return;
-            };
             while !stop_flag.load(Ordering::Relaxed) {
-                if cancel.load(Ordering::Acquire) {
+                if cancel_thread.load(Ordering::Acquire) {
                     break;
                 }
-                if free_space(&dir).is_some_and(|free| free < floor) {
+                if free_space(&dir_thread).is_some_and(|free| free < floor) {
                     exceeded_flag.store(true, Ordering::Release);
-                    cancel.store(true, Ordering::Release);
+                    cancel_thread.store(true, Ordering::Release);
                     break;
                 }
                 std::thread::sleep(SPACE_POLL);
             }
         });
-        Self {
+        Ok(Self {
             stop,
             exceeded,
+            cancel,
+            dir,
+            floor,
             handle: Some(handle),
-        }
+        })
     }
 
-    pub fn exceeded(&self) -> bool {
+    /// Stop the watcher, take one final reading, and report whether the floor
+    /// was reached. Reading only inside the thread loses the last poll window.
+    pub fn finish(mut self) -> bool {
+        self.shutdown();
         self.exceeded.load(Ordering::Acquire)
+    }
+
+    fn shutdown(&mut self) {
+        if self.handle.is_none() {
+            return;
+        }
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        if !self.cancel.load(Ordering::Acquire)
+            && free_space(&self.dir).is_some_and(|free| free < self.floor)
+        {
+            self.exceeded.store(true, Ordering::Release);
+        }
     }
 }
 
 impl Drop for SpaceGuard {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+        self.shutdown();
     }
 }
 
@@ -744,6 +782,7 @@ pub fn extract_selected_with_progress(
         files,
         bytes,
         log: output,
+        warning: None,
     })
 }
 
@@ -835,6 +874,7 @@ fn create_inner(
         files: 1,
         bytes,
         log: output,
+        warning: None,
     })
 }
 

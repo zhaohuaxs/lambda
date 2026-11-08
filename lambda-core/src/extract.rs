@@ -75,7 +75,9 @@ fn run(job: &Shared, waker: &Waker, plan: Plan) -> Outcome {
     let out = staging.join("extracted");
     let outcome = match gate(&plan, &staging) {
         Ok(()) => match extract(job, waker, &plan, &out) {
-            Ok(bytes) => export(job, waker, &plan, &staging, &out, bytes),
+            Ok((bytes, space_exceeded)) => {
+                export(job, waker, &plan, &staging, &out, bytes, space_exceeded)
+            }
             Err(Failure::Cancelled) => Outcome::Cancelled,
             Err(Failure::Message(message)) => Outcome::Failed(message),
         },
@@ -114,7 +116,7 @@ impl From<String> for Failure {
     }
 }
 
-fn extract(job: &Shared, waker: &Waker, plan: &Plan, out: &Path) -> Result<u64, Failure> {
+fn extract(job: &Shared, waker: &Waker, plan: &Plan, out: &Path) -> Result<(u64, bool), Failure> {
     Job::set_phase(job, "解压");
     Job::step(job, "解压", 0, &plan.stem);
     waker.wake();
@@ -126,14 +128,16 @@ fn extract(job: &Shared, waker: &Waker, plan: &Plan, out: &Path) -> Result<u64, 
     // Windows 会真的杀掉子进程，这里的取消标志两种平台都传下去。
     let _ticker = Ticker::start(waker.clone(), WAKE_INTERVAL);
     let password = (!plan.password.is_empty()).then_some(plan.password.as_str());
-    let space = sevenzip_src::SpaceGuard::start(out, cancel.clone());
+    let space = sevenzip_src::SpaceGuard::start(out, cancel.clone())
+        .map_err(|error| Failure::Message(error.0))?;
     let outcome = backend::extract_entries(&plan.archive, password, out, &plan.paths, slot, cancel);
+    let space_exceeded = space.finish();
     let bytes = match outcome {
         Ok(bytes) => bytes,
         Err(message) => {
             // The guard sets the same cancel flag the user does; check it
             // before translating the engine's generic "已取消".
-            if space.exceeded() {
+            if space_exceeded {
                 return Err(Failure::Message(
                     "空间不足：解压过程中可用空间低于安全余量，已停止".into(),
                 ));
@@ -145,12 +149,10 @@ fn extract(job: &Shared, waker: &Waker, plan: &Plan, out: &Path) -> Result<u64, 
             });
         }
     };
-    let space_exceeded = space.exceeded();
-    drop(space);
     if !space_exceeded && job.lock().map(|guard| guard.cancelled()).unwrap_or(false) {
         return Err(Failure::Cancelled);
     }
-    Ok(bytes)
+    Ok((bytes, space_exceeded))
 }
 
 fn export(
@@ -160,6 +162,7 @@ fn export(
     staging: &Path,
     out: &Path,
     bytes: u64,
+    space_exceeded: bool,
 ) -> Outcome {
     Job::set_phase(job, "导出");
     job.lock()
@@ -194,7 +197,7 @@ fn export(
 
     let mut exported = 0usize;
     for source in &sources {
-        if job.lock().map(|guard| guard.cancelled()).unwrap_or(false) {
+        if !space_exceeded && job.lock().map(|guard| guard.cancelled()).unwrap_or(false) {
             return Outcome::Cancelled;
         }
         waker.wake();

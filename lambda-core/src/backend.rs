@@ -392,24 +392,6 @@ pub fn probe_engine() -> Result<String> {
     }
 }
 
-pub fn extract_archive(archive: &Path, password: Option<&str>, out: &Path) -> Result<Report> {
-    #[cfg(any(windows, target_os = "android"))]
-    {
-        prepare_engine();
-        let report = sevenzip_src::extract(archive, password, out).map_err(|error| error.0)?;
-        Ok(Report {
-            files: report.files,
-            bytes: report.bytes,
-            engine: sevenzip_src::engine_name().into(),
-        })
-    }
-    #[cfg(not(any(windows, target_os = "android")))]
-    {
-        let _ = (archive, password, out);
-        Err("本平台没有 7-Zip 引擎".into())
-    }
-}
-
 pub fn create_archive(
     archive: &Path,
     inputs: &[PathBuf],
