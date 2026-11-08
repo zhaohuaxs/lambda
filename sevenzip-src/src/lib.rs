@@ -508,12 +508,15 @@ pub fn extract_guarded(
     let outcome = extract_with_cancel(archive, password, out_dir, Some(&cancel));
     let exceeded = guard.exceeded();
     drop(guard);
-    if exceeded {
-        return Err(Error(
+    match outcome {
+        // The guard may trip just as the engine finishes; a complete output
+        // is not a failure.
+        Ok(report) => Ok(report),
+        Err(_) if exceeded => Err(Error(
             "空间不足：解压过程中可用空间低于安全余量，已停止".into(),
-        ));
+        )),
+        Err(error) => Err(error),
     }
-    outcome
 }
 
 /// List the archive once and check its declared output before the CLI writes
